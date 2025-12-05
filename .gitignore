@@ -1,0 +1,4 @@
+GVHMR/inputs/checkpoints/
+__pycache__/
+*.pyc
+debug_wall_overlay/
