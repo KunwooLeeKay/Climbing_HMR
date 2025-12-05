@@ -1,0 +1,5 @@
+{
+  "L": 500,
+  "frame_pattern": "frame_%06d.jpg",
+  "note": "Vertices/Joints are in the per-frame camera (incam) coordinate system."
+}
