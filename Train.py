@@ -280,6 +280,8 @@ def main():
     # 3. Load Data
     print("\nLOADING DATA...")
     training_sessions = sorted(os.listdir('ascendmotion_merged'))
+    training_sessions = training_sessions[:-1]
+    test_session = training_sessions[-1]
     
     data = []
     for s in training_sessions:
