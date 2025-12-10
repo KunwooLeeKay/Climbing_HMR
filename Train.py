@@ -583,7 +583,7 @@ def main():
     training_data = []
     for session in training_sessions:
         session_dir = session.replace("_images", "")
-        smpl_path = f'/home/kunwoo/Kunwoo/GVHMR/outputs/ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
+        smpl_path = f'ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
         
         if not os.path.exists(smpl_path):
             print(f"Warning: {smpl_path} not found, skipping")

@@ -243,7 +243,7 @@ def main():
     print(f"Optimizing Session: {session_dir}")
     
     # Load SMPL Params
-    smpl_path = f'/home/kunwoo/Kunwoo/GVHMR/outputs/ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
+    smpl_path = f'ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
     smpl_params = torch.load(smpl_path, map_location=device)
 
     
