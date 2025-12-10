@@ -301,7 +301,7 @@ def main():
         print(f"  ✓ {s}")
 
     # 4. VISUALIZATION STEP
-    produce_alignment_vid = True
+    produce_alignment_vid = False
     if produce_alignment_vid:
         print("\n" + "="*60 + "\nVERIFYING ALIGNMENT (VIDEO)\n" + "="*60)
         if len(data) > 0:
