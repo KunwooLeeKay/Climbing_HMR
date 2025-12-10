@@ -101,6 +101,7 @@ class Wall(nn.Module):
         # Setup camera
         T = np.array([[-1, 0, 0, 0.], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
         cam_mat = self._get_intrinsics(self.H, self.W)
+        print(f"  - Camera intrinsics:\n{cam_mat}")
         self.camera, self.lights = build_stationary_camera(T, (self.H, self.W), camera_matrix=cam_mat)
         self.camera.to(self.device)
         self.lights.to(self.device)
@@ -562,94 +563,6 @@ class Wall(nn.Module):
         
         print(f"  ✓ Saved mesh: {output_path}")
 
-def find_alignment_transform(wall, wall_vertices, smpl_vertices, gvhmr_K):
-    """
-    Find the transformation that aligns SMPL with wall by matching their projections.
-    
-    Strategy: Since both mesh projections are correct in their own systems,
-    we need to find the transform T such that:
-    - wall_camera.project(wall_verts) and wall_camera.project(T @ smpl_verts) 
-      give the same image coordinates
-    """
-    import cv2
-    
-    # Step 1: Get GVHMR projection (ground truth for where SMPL should appear)
-    smpl_verts_np = smpl_vertices[0].cpu().numpy()
-    gvhmr_K_np = gvhmr_K[0].cpu().numpy()
-    
-    # Project using GVHMR's camera
-    projected_gvhmr = (gvhmr_K_np @ smpl_verts_np.T).T
-    u_gvhmr = projected_gvhmr[:, 0] / projected_gvhmr[:, 2]
-    v_gvhmr = projected_gvhmr[:, 1] / projected_gvhmr[:, 2]
-    
-    # Step 2: We need SMPL in wall's coordinate system such that
-    # wall_camera projects it to the same (u_gvhmr, v_gvhmr)
-    
-    # Get wall's camera matrix
-    wall_K = wall._get_intrinsics(wall.H, wall.W)
-    
-    # The key insight: we need to solve for the 3D position in wall's coordinate
-    # system that projects to (u_gvhmr, v_gvhmr)
-    
-    # For a sample of correspondences, we can estimate the transformation
-    # Let's use the SMPL body center as a reference point
-    
-    smpl_center_gvhmr = smpl_verts_np.mean(axis=0)  # (3,)
-    
-    # Project to image using GVHMR
-    p_gvhmr = gvhmr_K_np @ smpl_center_gvhmr
-    u_center = p_gvhmr[0] / p_gvhmr[2]
-    v_center = p_gvhmr[1] / p_gvhmr[2]
-    
-    print(f"\nSMPL center projects to: ({u_center:.1f}, {v_center:.1f})")
-    
-    # Now, we need to find the 3D point in wall's coordinate system that projects there
-    # Use depth from wall mesh at that location to estimate scale
-    
-    # Find wall vertices that project near the SMPL center
-    wall_verts_np = wall_vertices[0].cpu().numpy()
-    points_screen = wall.camera.transform_points_screen(
-        wall_vertices, 
-        image_size=((wall.H, wall.W),)
-    )[0].cpu().numpy()
-    
-    u_wall = points_screen[:, 0]
-    v_wall = points_screen[:, 1]
-    z_wall = wall_verts_np[:, 2]  # Depth in wall coordinates
-    
-    # Find wall depth at SMPL center location
-    dist_to_center = (u_wall - u_center)**2 + (v_wall - v_center)**2
-    nearest_idx = np.argmin(dist_to_center)
-    reference_depth_wall = z_wall[nearest_idx]
-    
-    print(f"Wall depth at SMPL location: {reference_depth_wall:.3f}")
-    print(f"SMPL depth in GVHMR coords: {smpl_center_gvhmr[2]:.3f}")
-    
-    # Step 3: Compute transformation
-    # We know: GVHMR convention is [X, Y, Z] with Z forward
-    # We need to find what [X', Y', Z'] in wall coords corresponds to same image point
-    
-    # Unproject SMPL center using GVHMR camera
-    ray_gvhmr = np.linalg.inv(gvhmr_K_np) @ np.array([u_center, v_center, 1.0])
-    point_3d_gvhmr = ray_gvhmr * smpl_center_gvhmr[2]  # Scale by depth
-    
-    # Unproject same image point using wall camera at wall's depth
-    ray_wall = np.linalg.inv(wall_K) @ np.array([u_center, v_center, 1.0])
-    point_3d_wall = ray_wall * reference_depth_wall
-    
-    print(f"\nSame image point maps to:")
-    print(f"  GVHMR 3D: {point_3d_gvhmr}")
-    print(f"  Wall 3D:  {point_3d_wall}")
-    
-    # The transformation is: rotation + scale + translation
-    # Scale factor
-    scale = reference_depth_wall / smpl_center_gvhmr[2]
-    
-    print(f"\nEstimated scale: {scale:.4f}")
-    
-    return scale, point_3d_gvhmr, point_3d_wall
-
-
 def example_usage():
     """Example usage of Wall class"""
 
@@ -801,7 +714,7 @@ def example_usage():
     rendered_np = (overlay.cpu().numpy() * 255).astype(np.uint8)
     imageio.imwrite('output_examples/wall_smpl_combined.png', rendered_np)
     print("\n✓ Saved: output_examples/wall_smpl_combined.png")
-    
+
 if __name__ == "__main__":
     print('TESTING WALL PARAMETERIZATION MODULE...')
     example_usage()

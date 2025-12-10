@@ -23,19 +23,13 @@ import smplx
 import cv2
 import imageio
 from tqdm import tqdm
+import glob
 
 def SMPL_to_mesh_single(smpl_params, body_model, device):
     """Create mesh for a single frame"""
-    params = dict(
-        global_orient=smpl_params['global_orient'],
-        body_pose=smpl_params['body_pose'],        
-        betas=smpl_params['betas'],
-        transl=smpl_params['trans'],
-        return_verts=True,
-    )
     
     with torch.no_grad():
-        out = body_model(**params)
+        out = body_model(**smpl_params)
     
     verts = out.vertices.to(device)
     faces = torch.from_numpy(body_model.faces.astype(np.int64)).to(device)
@@ -195,12 +189,6 @@ def viz_scene_batched(smpl_seq=None, images = None, T_w2c=None,
     else:
         Hbg, Wbg = 512, 512
 
-
-    
-    # stream to file
-    writer = imageio.get_writer(savepath.replace('.mp4', '_SMPL.mp4'), fps=FPS, codec="libx264", quality=8)
-
-
     # Create body model and get verts and faces
     body_model = smplx.create(
         model_path="smpl_models/models",
@@ -210,6 +198,7 @@ def viz_scene_batched(smpl_seq=None, images = None, T_w2c=None,
         ext="pkl",
         batch_size=1
     ).to(device)
+    
     with torch.no_grad():
         out = body_model(**smpl_seq)
     verts = out.vertices.to(device)
@@ -225,12 +214,16 @@ def viz_scene_batched(smpl_seq=None, images = None, T_w2c=None,
     light = light.to(device)
 
     # define mesh renderer
-    renderer = get_mesh_renderer(image_size=(Hbg, Wbg), lights=light, device=device, cameras = camera)
+    renderer = get_mesh_renderer(image_size=(Hbg, Wbg), device=device)
     
     # Process batched frames without rendering everything at once
     N_frames = smpl_seq['body_pose'].shape[0]
     tqdm_range = tqdm(range(0, N_frames, batch_size), desc="Rendering SMPL Sequence")
-    for i in tqdm_range:    
+    frame_number = 0
+    for i in tqdm_range:
+        if i + batch_size > N_frames: # last batch
+            batch_size = N_frames - i
+            
         # Create mesh for single frame
         mesh = pytorch3d.structures.Meshes(
             verts[i:i+batch_size], faces[i:i+batch_size], 
@@ -254,6 +247,9 @@ def viz_scene_batched(smpl_seq=None, images = None, T_w2c=None,
 
         # Alpha composite on GPU
         alpha = rend[..., 3:4]
+
+        if rend.shape[0] != img.shape[0]:
+            st()
         frames = rend[..., :3] * alpha + img[..., :3] * (1 - alpha)
         frames = frames.clamp(0, 1).cpu().numpy()  # (B,H,W,3)
 
@@ -261,9 +257,34 @@ def viz_scene_batched(smpl_seq=None, images = None, T_w2c=None,
         for frame in frames:
             frame = (frame[..., :3] * 255).clip(0, 255).astype(np.uint8)
             frame = cv2.resize(frame, (Wbg//downsizing_factor, Hbg//downsizing_factor), interpolation=cv2.INTER_AREA)
-            writer.append_data(frame)
-    writer.close()
+            # save temp frames as .jpeg
+            os.makedirs('temp_frames', exist_ok=True)
+            # clean up old frames
+            if frame_number == 0:
+                old_frames = glob.glob(str("temp_frames/*.jpg"))
+                for f in old_frames:
+                    os.remove(f)
+            imageio.imwrite(f'temp_frames/{frame_number:05d}.jpg', frame)
+            frame_number += 1
 
+        del rend, frames, img
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # stitch images to video
+    jpgs = sorted(glob.glob(str("temp_frames/*.jpg")))
+    assert len(jpgs) > 0, "No temp frames written."
+
+    first = cv2.imread(jpgs[0])
+    h, w = first.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    vw = cv2.VideoWriter(savepath, fourcc, FPS, (w, h))
+
+    jpgs = tqdm(jpgs, desc="Stitching frames to video")
+    for p in jpgs:
+        im = cv2.imread(p)
+        vw.write(im)
+    vw.release()
 
 
 
@@ -334,6 +355,73 @@ def build_360_camera(N_frames, distance = 3, elev = 30):
 
     return cameras, lights
 
+
+def build_360_camera_yz_plane(N_frames, distance=3.0):
+    # angle in degrees, then radians
+    ang_deg = torch.linspace(0, 360, N_frames)
+    ang_rad = ang_deg * np.pi / 180.0
+
+    # Orbit in YZ plane, x is constant
+    x = torch.zeros_like(ang_rad)                # x stays fixed
+    y = distance * torch.cos(ang_rad)            # circle in YZ
+    z = distance * torch.sin(ang_rad)
+
+    # eye has shape (N, 3)
+    eye = torch.stack([x, y, z], dim=1)
+
+    # camera always looks at the origin
+    at = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+    # choose an up vector that is not parallel to the viewing direction
+    up = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)   # X as "up" here
+
+    R, T = pytorch3d.renderer.cameras.look_at_view_transform(eye=eye, at=at, up=up)
+
+    cameras = pytorch3d.renderer.FoVPerspectiveCameras(R=R, T=T, fov=60.0)
+
+    lights = pytorch3d.renderer.PointLights(
+        location=eye,
+    )
+
+
+    return cameras, lights
+
+
+def build_360_camera_xy_plane(N_frames, distance=3.0):
+    # angle in degrees, then radians
+    ang_deg = torch.linspace(0, 360, N_frames)
+    ang_rad = ang_deg * np.pi / 180.0
+
+    # Orbit in YZ plane, x is constant
+    x = torch.zeros_like(ang_rad)                # x stays fixed
+    y = distance * torch.cos(ang_rad)            # circle in YZ
+    z = distance * torch.sin(ang_rad)
+
+    z = torch.zeros_like(ang_rad)                # x stays fixed
+    y = distance * torch.cos(ang_rad)            # circle in YZ
+    x = distance * torch.sin(ang_rad)
+
+    # eye has shape (N, 3)
+    eye = torch.stack([x, y, z], dim=1)
+
+    # camera always looks at the origin
+    at = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+    # choose an up vector that is not parallel to the viewing direction
+    up = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)   # X as "up" here
+
+    R, T = pytorch3d.renderer.cameras.look_at_view_transform(eye=eye, at=at, up=up)
+
+    cameras = pytorch3d.renderer.FoVPerspectiveCameras(R=R, T=T, fov=60.0)
+
+    lights = pytorch3d.renderer.PointLights(
+        location=eye,
+    )
+
+
+    return cameras, lights
+
+
 def make_gif(rend, N_frames, savepath = 'out.gif', loop = 0):
     
     import imageio
@@ -356,34 +444,29 @@ from pytorch3d.renderer import (
     RasterizationSettings, BlendParams
 )
 
-def get_mesh_renderer(
-    cameras,
-    image_size=(512, 512),          # (H, W)
-    lights=None,
-    device=None,
-    soft=False,                      # True -> SoftPhong (smoother), False -> HardPhong (faster)
-    faces_per_pixel=1,               # >1 gives AA/soft edges but costs time
-    cull_backfaces=True,
-    ):
+def get_mesh_renderer(image_size=512, lights=None, device=None):
+    """
+    Returns a Pytorch3D Mesh Renderer.
+
+    Args:
+        image_size (int): The rendered image size.
+        lights: A default Pytorch3D lights object.
+        device (torch.device): The torch device to use (CPU or GPU). If not specified,
+            will automatically use GPU if available, otherwise CPU.
+    """
     if device is None:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    rast_settings = RasterizationSettings(
-        image_size=image_size,
-        faces_per_pixel=faces_per_pixel,
-        cull_backfaces=cull_backfaces,
-        blur_radius=0.0,             # keep 0.0 for speed (set >0 only if using soft edges)
-        bin_size=0,                  # auto-tune tiling on GPU
-        max_faces_per_bin=0          # auto-tune
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+        else:
+            device = torch.device("cpu")
+    raster_settings = RasterizationSettings(
+        image_size=image_size, blur_radius=0.0, faces_per_pixel=1,
     )
-
-    blend = BlendParams(background_color=(0.0, 0.0, 0.0))
-
-    rasterizer = MeshRasterizer(cameras=cameras, raster_settings=rast_settings)
-    Shader = SoftPhongShader if soft else HardPhongShader
-    shader = Shader(device=device, cameras=cameras, lights=lights, blend_params=blend)
-
-    return MeshRenderer(rasterizer=rasterizer, shader=shader)
+    renderer = MeshRenderer(
+        rasterizer=MeshRasterizer(raster_settings=raster_settings),
+        shader=HardPhongShader(device=device, lights=lights),
+    )
+    return renderer
 
 def get_points_renderer(
     image_size=512, device=None, radius=0.01, background_color=(1, 1, 1)
