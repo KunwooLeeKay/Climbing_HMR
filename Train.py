@@ -301,8 +301,8 @@ def main():
         print(f"  ✓ {s}")
 
     # 4. VISUALIZATION STEP
-    verify_alignment_video = True
-    if verify_alignment_video:
+    produce_alignment_vid = True
+    if produce_alignment_vid:
         print("\n" + "="*60 + "\nVERIFYING ALIGNMENT (VIDEO)\n" + "="*60)
         if len(data) > 0:
             verify_alignment_video(data[0], wall, verts_wall_cam, device)
