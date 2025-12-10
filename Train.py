@@ -27,7 +27,16 @@ from pytorch3d.renderer import (
 from loss.Loss import ClimbingLoss 
 from wall_parameterization.Wall import Wall 
 
+import argparse
+
 from pdb import set_trace as st
+
+# Make argparse object
+parser = argparse.ArgumentParser(description='Run Training')
+parser.add_argument('--viz_overlay', type=int, help='Sequence index', default=False)
+args = parser.parse_args()
+
+
 
 # ============================================================================
 # 1. Visualization Function (Updated for Training Loop)
@@ -329,25 +338,26 @@ def main():
         with open(log_path, "a") as f: f.write(f"{ep}, {loss:.6f}\n")
         
         if (ep+1)%10==0: trainer.save(f'checkpoints/cp_{ep+1}.pt', ep, opt, loss)
-        
-        # --- VIDEO SAVING EVERY 20 ITERATIONS ---
-        if (ep + 1) % 20 == 0:
-            print(f"\nCreating visualization for Epoch {ep}...")
-            # Pick the first session (data[0]) to visualize consistency
-            vis_sample = data[0]
-            with torch.no_grad():
-                # Get REFINED vertices using the current trained MLP
-                refined_verts, _ = trainer.forward_pass(vis_sample['smpl_params'], vis_sample['betas'])
-                
-            verify_alignment_video(
-                session_data=vis_sample, 
-                wall_obj=wall, 
-                verts_wall_cam=verts_wall_cam, 
-                device=device,
-                output_path=f"checkpoints/vis_epoch_{ep}.mp4",
-                refined_verts=refined_verts
-            )
-        # ----------------------------------------
+
+        if args.viz_overlay is True:        
+            # --- VIDEO SAVING EVERY 20 ITERATIONS ---
+            if (ep + 1) % 20 == 0:
+                print(f"\nCreating visualization for Epoch {ep}...")
+                # Pick the first session (data[0]) to visualize consistency
+                vis_sample = data[0]
+                with torch.no_grad():
+                    # Get REFINED vertices using the current trained MLP
+                    refined_verts, _ = trainer.forward_pass(vis_sample['smpl_params'], vis_sample['betas'])
+                    
+                verify_alignment_video(
+                    session_data=vis_sample, 
+                    wall_obj=wall, 
+                    verts_wall_cam=verts_wall_cam, 
+                    device=device,
+                    output_path=f"checkpoints/vis_epoch_{ep}.mp4",
+                    refined_verts=refined_verts
+                )
+            # ----------------------------------------
 
 if __name__ == "__main__":
     main()
