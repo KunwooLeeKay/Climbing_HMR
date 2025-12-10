@@ -279,7 +279,6 @@ def main():
 
     # 3. Load Data
     print("\nLOADING DATA...")
-    # Add your session list here
     wall1_sessions = ['20240927JimeiYanwu_WJY_001_images', '20240927JimeiYanwu_WJY_002_images', '20240927JimeiYanwu_WJY_003_images', '20240927JimeiYanwu_WJY_004_images', '20240927JimeiYanwu_WJY_005_images']
     training_sessions = wall1_sessions[:-1]
     
@@ -300,14 +299,12 @@ def main():
         data.append({'smpl_params': params, 'betas': params.get('betas', torch.zeros(len(params['body_pose']), 10, device=device)), 'session_name': s.replace("_images",""), 'gvhmr_K': params['K_fullimg']})
         print(f"  ✓ {s}")
 
-    # 4. VISUALIZATION STEP
-    produce_alignment_vid = False
-    if produce_alignment_vid:
-        print("\n" + "="*60 + "\nVERIFYING ALIGNMENT (VIDEO)\n" + "="*60)
-        if len(data) > 0:
-            verify_alignment_video(data[0], wall, verts_wall_cam, device)
-        else:
-            print("No data loaded, skipping visualization.")
+    # # 4. VISUALIZATION STEP
+    # print("\n" + "="*60 + "\nVERIFYING ALIGNMENT (VIDEO)\n" + "="*60)
+    # if len(data) > 0:
+    #     verify_alignment_video(data[0], wall, verts_wall_cam, device)
+    # else:
+    #     print("No data loaded, skipping visualization.")
 
     # 5. Training
     print("\n" + "="*60 + "\nSTARTING TRAINING\n" + "="*60)
@@ -315,7 +312,17 @@ def main():
     loss_fn = ClimbingLoss(device=device)
     trainer = ClimbingMocapTrainer(verts_wall_cam, wall.faces, body, loss_fn, device)
     loader = DataLoader(ClimbingMocapDataset(data), batch_size=1, shuffle=True, collate_fn=collate_fn)
-    opt = optim.Adam([])
+    
+    # --- FIX: Initialize MLP and Optimizer BEFORE the loop ---
+    # We grab the first batch manually to initialize the network dimensions
+    first_batch = next(iter(loader))
+    # Dummy pass to create trainer.smpl_mlp
+    trainer.forward_pass(first_batch['smpl_params'], first_batch['betas'])
+    
+    # Now we can safely create the optimizer because trainer.smpl_mlp is not None
+    opt = optim.Adam(trainer.smpl_mlp.parameters(), lr=1e-4)
+    print("✓ Optimizer initialized with MLP parameters.")
+    # ---------------------------------------------------------
     
     Path('checkpoints').mkdir(exist_ok=True)
     for ep in range(50):

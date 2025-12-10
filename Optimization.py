@@ -359,12 +359,12 @@ def main():
     vis_dir = Path(f'alignment_check')
     vis_dir.mkdir(parents=True, exist_ok=True)
     
-    render_alignment_video(
-        vertices=vertices_SMPL_init,
-        K=smpl_params['K_fullimg'],
-        image_dir=image_dir_path,
-        output_path=vis_dir / f'{target_session}_initial_state.mp4'
-    )
+    # render_alignment_video(
+    #     vertices=vertices_SMPL_init,
+    #     K=smpl_params['K_fullimg'],
+    #     image_dir=image_dir_path,
+    #     output_path=vis_dir / f'{target_session}_initial_state.mp4'
+    # )
     
     # ========================================================================
     # 4. Run Optimization
