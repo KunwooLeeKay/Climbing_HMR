@@ -23,10 +23,10 @@ from tqdm import tqdm
 import json
 from pytorch3d.transforms import matrix_to_axis_angle
 
-# Custom imports (Keeping your original imports)
+# Custom imports
 from wall_parameterization.Wall import Wall
 from loss.Loss import ClimbingLoss
-from SMPL_wall_aligner.Align import SMPLWallAligner
+# from SMPL_wall_aligner.Align import SMPLWallAligner # REMOVED
 
 from pdb import set_trace as st
 
@@ -41,28 +41,50 @@ class ClimbingOptimizer:
     def __init__(self,
                  wall: Wall,
                  body_model: smplx.SMPL,
-                 aligner: SMPLWallAligner,
                  loss_fn: ClimbingLoss,
                  device: str = 'cuda'):
         
         self.wall = wall
         self.body_model = body_model
-        self.aligner = aligner
+        # self.aligner = aligner # REMOVED
         self.loss_fn = loss_fn
         self.device = device
+        
+        # Define the Wall -> Camera transformation matrix (Fixed)
+        # This matches the visualization code logic
+        self.R_wc = torch.tensor([
+            [-1, 0, 0, 0.], 
+            [0, 0, -1, 0], 
+            [0, -1, 0, 0], 
+            [0, 0, 0, 1]
+        ], device=device).float()
+
+    def _apply_wall_transform(self, vertices_wall_local):
+        """
+        Transforms Wall vertices from Local Space to Camera Space using R_wc.
+        """
+        # Convert to homogeneous coordinates: (N, 3) -> (N, 4)
+        ones = torch.ones((vertices_wall_local.shape[0], 1), device=self.device)
+        verts_homo = torch.cat([vertices_wall_local, ones], dim=1)
+        
+        # Apply transformation: (R @ V.T).T
+        # R_wc is (4, 4), verts_homo.T is (4, N) -> Result (4, N) -> Transpose back to (N, 4)
+        verts_cam_homo = (self.R_wc @ verts_homo.T).T
+        
+        # Return 3D coordinates
+        return verts_cam_homo[:, :3]
 
     def _compute_batched_loss(self, 
-                              vertices_SMPL_aligned, 
-                              vertices_wall, 
+                              vertices_SMPL, 
+                              vertices_wall_cam, 
                               batch_size=32, 
                               **loss_kwargs):
         """
-        Computes geometry-based losses (Contact, Penetration) in chunks to save memory.
+        Computes geometry-based losses (Contact, Penetration) in chunks.
         """
-        num_frames = vertices_SMPL_aligned.shape[0]
+        num_frames = vertices_SMPL.shape[0]
         total_main_loss = 0.0
         
-        # We also want to accumulate the breakdown for logging
         total_loss_dict = {
             'contact_loss': 0.0,
             'penetration_loss': 0.0,
@@ -71,27 +93,24 @@ class ClimbingOptimizer:
 
         # Loop through frames in batches
         for i in range(0, num_frames, batch_size):
-            # 1. Slice the data
             end = min(i + batch_size, num_frames)
             current_batch_size = end - i
             
             # Slice SMPL vertices for this batch
-            batch_smpl_verts = vertices_SMPL_aligned[i:end]
+            batch_smpl_verts = vertices_SMPL[i:end]
             
-            # 2. Compute loss for this chunk
+            # Compute loss for this chunk
+            # Note: vertices_wall_cam is static for the whole sequence (optimization step), 
+            # so we pass the whole wall.
             batch_loss, batch_dict = self.loss_fn(
                 smpl_vertices=batch_smpl_verts,
-                wall_vertices=vertices_wall,
+                wall_vertices=vertices_wall_cam, 
                 **loss_kwargs
             )
             
-            # 3. Accumulate (Weighted Average)
             weight = current_batch_size / num_frames
-            
-            # Important: Keep the computation graph for backprop!
             total_main_loss += batch_loss * weight
             
-            # Accumulate metrics for logging (no grad needed usually)
             for k, v in batch_dict.items():
                 if k in total_loss_dict:
                     total_loss_dict[k] += v.detach() * weight
@@ -99,7 +118,7 @@ class ClimbingOptimizer:
         return total_main_loss, total_loss_dict
 
     def _batch_smpl_forward(self, smpl_params, batch_size=128):
-        """Helper to run SMPL forward pass in chunks to save memory."""
+        """Helper to run SMPL forward pass in chunks."""
         num_frames = smpl_params['body_pose'].shape[0]
         vertices_list = []
         
@@ -121,13 +140,8 @@ class ClimbingOptimizer:
         """
         
         # 1. Setup Learnable Parameters (Deltas)
-        # Wall Deltas
-        wall_angles_delta = nn.Parameter(
-            torch.zeros_like(wall_angles_init, device=self.device)
-        )
+        wall_angles_delta = nn.Parameter(torch.zeros_like(wall_angles_init, device=self.device))
         
-        # SMPL Deltas
-        # Detach and clone to ensure we don't modify original data
         betas = smpl_params_init['betas'].detach()
         body_pose_delta = nn.Parameter(torch.zeros_like(smpl_params_init['body_pose']))
         global_orient_delta = nn.Parameter(torch.zeros_like(smpl_params_init['global_orient']))
@@ -163,18 +177,27 @@ class ClimbingOptimizer:
             }
             
             # --- Forward Pass ---
-            vertices_wall = self.wall.forward(current_wall_angles)
+            # A. Wall Forward (Local Space)
+            vertices_wall_local = self.wall.forward(current_wall_angles)
             
-            # Batch the SMPL generation
+            # B. Transform Wall to Camera Space (The key fix!)
+            # We assume batch_size=1 for wall angles, so vertices_wall_local is (1, N, 3) or (N, 3)
+            # Remove batch dim if exists for transform helper
+            if vertices_wall_local.dim() == 3:
+                v_wall_input = vertices_wall_local[0] 
+            else:
+                v_wall_input = vertices_wall_local
+                
+            vertices_wall_cam = self._apply_wall_transform(v_wall_input)
+            
+            # C. SMPL Forward (Already in Camera Space)
             vertices_SMPL = self._batch_smpl_forward(current_smpl_params, batch_size=64)
             
-            # Align
-            vertices_SMPL_aligned = self.aligner.apply_transform(vertices_SMPL)
-            
-            # --- Loss Computation (BATCHED) ---
+            # --- Loss Computation ---
+            # Pass both in Camera Space
             main_loss, loss_dict = self._compute_batched_loss(
-                vertices_SMPL_aligned=vertices_SMPL_aligned,
-                vertices_wall=vertices_wall,
+                vertices_SMPL=vertices_SMPL, 
+                vertices_wall_cam=vertices_wall_cam,
                 batch_size=32,
                 lidar_points=None,
                 contact_weight=1.0,
@@ -214,6 +237,65 @@ class ClimbingOptimizer:
             })
             
         return best_params
+    
+
+import cv2
+import glob
+def render_alignment_video(vertices, K, image_dir, output_path, fps=30):
+    """
+    Renders the SMPL vertices projected onto the original video frames.
+    """
+    print(f"Rendering alignment video to {output_path}...")
+    
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.jpg")) + 
+                         glob.glob(os.path.join(image_dir, "*.png")))
+    
+    if len(image_paths) == 0:
+        print(f"Warning: No images found in {image_dir}. Skipping video.")
+        return
+
+    first_img = cv2.imread(image_paths[0])
+    height, width, _ = first_img.shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    vertices = vertices.detach().cpu().numpy()
+    if torch.is_tensor(K):
+        K = K.detach().cpu().numpy()
+    
+    if K.ndim == 3:
+        K = K[0]
+        
+    num_frames = min(len(image_paths), vertices.shape[0])
+    
+    for i in tqdm(range(num_frames), desc="Rendering Video"):
+        img = cv2.imread(image_paths[i])
+        
+        # Downsample for visualization speed
+        verts_frame = vertices[i][::10] 
+        
+        z = verts_frame[:, 2]
+        # Avoid division by zero
+        z[z==0] = 1e-5
+        
+        x = verts_frame[:, 0] / z
+        y = verts_frame[:, 1] / z
+        
+        u = (x * K[0, 0] + K[0, 2]).astype(int)
+        v = (y * K[1, 1] + K[1, 2]).astype(int)
+        
+        valid = (u >= 0) & (u < width) & (v >= 0) & (v < height) & (z > 0)
+        u_valid = u[valid]
+        v_valid = v[valid]
+        
+        for px, py in zip(u_valid, v_valid):
+            cv2.circle(img, (px, py), 2, (255, 255, 0), -1)
+            
+        out.write(img)
+        
+    out.release()
+    print("Video saved.")
+
 # ============================================================================
 # Main Script
 # ============================================================================
@@ -228,25 +310,16 @@ def main():
     print("LOADING DATA")
     print("="*60)
     
-    
-    # video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
-    # training_sessions_dirs = [s for s in os.listdir(video_path) if s.endswith('_images')]
-    # wall1_sessions = [s for s in training_sessions_dirs if s.startswith('20240927') and 'WJY' in s]
     wall1_sessions = ['20240927JimeiYanwu_WJY_001_images', '20240927JimeiYanwu_WJY_002_images', '20240927JimeiYanwu_WJY_003_images', '20240927JimeiYanwu_WJY_004_images', '20240927JimeiYanwu_WJY_005_images']
 
-    
-    # Let's pick ONE session to optimize for this example
-    # Optimization is usually done per-sequence
     target_session = wall1_sessions[0]
     session_dir = target_session.replace("_images", "")
     
     print(f"Optimizing Session: {session_dir}")
     
-    # Load SMPL Params
     smpl_path = f'ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
     smpl_params = torch.load(smpl_path, map_location=device)
 
-    
     # ========================================================================
     # 2. Initialize Models
     # ========================================================================
@@ -264,19 +337,34 @@ def main():
     
     # Initial Wall Angles (Flat)
     wall_angles_init = torch.zeros(1, wall.num_segments * 2, device=device)
-    
+
     # ========================================================================
-    # 3. Setup Alignment
+    # 3. Visualization Check (No Alignment Calculation Needed!)
     # ========================================================================
+    print("\n" + "="*60)
+    print("VISUALIZING INITIAL STATE")
+    print("="*60)
+
+    # Since SMPL is already in Camera space, we just render it directly.
+    # The wall alignment is handled internally during optimization, 
+    # but for this video we just check if SMPL looks correct on the image.
     
-    # Get initial vertices for alignment calculation
     with torch.no_grad():
         output = body_model(**smpl_params)
-        verts_init = output.vertices
-        verts_wall_init = wall.forward(wall_angles_init)
-        
-    aligner = SMPLWallAligner(wall=wall, gvhmr_K=smpl_params['K_fullimg'], device=device)
-    aligner.compute_alignment(verts_init, verts_wall_init, verbose=True)
+        vertices_SMPL_init = output.vertices
+
+    video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
+    image_dir_path = os.path.join(video_path, target_session) 
+    
+    vis_dir = Path(f'alignment_check')
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    
+    render_alignment_video(
+        vertices=vertices_SMPL_init,
+        K=smpl_params['K_fullimg'],
+        image_dir=image_dir_path,
+        output_path=vis_dir / f'{target_session}_initial_state.mp4'
+    )
     
     # ========================================================================
     # 4. Run Optimization
@@ -284,22 +372,20 @@ def main():
     
     loss_fn = ClimbingLoss(device=device)
     
+    # Initialize Optimizer (Now includes the R_wc transform internally)
     optimizer_engine = ClimbingOptimizer(
         wall=wall,
         body_model=body_model,
-        aligner=aligner,
-        loss_fn=loss_fn,
+        loss_fn=loss_fn, # Removed aligner arg
         device=device
     )
     
     print("\nStarting Optimization...")
     
-    # Run optimization
-    # Note: We pass the DATA, not a dataloader, because we optimize this specific data
     refined_results = optimizer_engine.optimize_sequence(
         smpl_params_init=smpl_params,
         wall_angles_init=wall_angles_init,
-        num_steps=300, # Adjust based on need
+        num_steps=300, 
         lr=1e-2
     )
     
