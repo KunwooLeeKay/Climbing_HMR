@@ -1,5 +1,5 @@
 """
-Wall Class - SMPL-style interface for wall mesh manipulation
+Wall Class - SMPL-style interface for wall mesh manipulation with SMPL overlay
 
 Similar to SMPL where:
 - SMPL has pose parameters (joint angles) that deform the body mesh
@@ -12,11 +12,8 @@ Usage:
     angles = torch.tensor([[5.0, 0.0, 0.0, -3.0, 0.0]])  # [batch_size, num_segments * 2]
     vertices = wall.forward(angles)  # Returns deformed vertices
     
-    # Render
-    image = wall.render(vertices)
-    
-    # Render from angled view
-    image_angled = wall.render_angled_view(vertices, azimuth=30, elevation=20)
+    # Render with SMPL overlay
+    image = wall.render_with_smpl(vertices, smpl_vertices)
 """
 
 import numpy as np
@@ -284,6 +281,36 @@ class Wall(nn.Module):
         loss = torch.nn.functional.mse_loss(vertices, target_vertices)
         return loss
     
+    def convert_smpl_coords(self, smpl_vertices):
+        """
+        Convert SMPL vertices from GVHMR/OpenCV camera coordinates to PyTorch3D coordinates.
+        
+        GVHMR incam output uses OpenCV convention:
+            +X: right, +Y: down, +Z: forward
+        
+        PyTorch3D uses:
+            +X: left, +Y: up, +Z: forward
+        
+        Args:
+            smpl_vertices: (B, N, 3) or (N, 3) SMPL vertices from GVHMR incam output
+        
+        Returns:
+            vertices_pytorch3d: Same shape, converted to PyTorch3D coordinate system
+        """
+        # Transformation from OpenCV to PyTorch3D
+        T_opencv_to_pytorch3d = torch.tensor([
+            [-1,  0,  0],  # Flip X: right -> left
+            [ 0, -1,  0],  # Flip Y: down -> up  
+            [ 0,  0,  1],  # Keep Z: forward stays forward
+        ], dtype=smpl_vertices.dtype, device=smpl_vertices.device)
+        
+        if smpl_vertices.dim() == 3:
+            vertices_pytorch3d = smpl_vertices @ T_opencv_to_pytorch3d.T
+        else:
+            vertices_pytorch3d = smpl_vertices @ T_opencv_to_pytorch3d.T
+        
+        return vertices_pytorch3d
+    
     def render(self, vertices, colors=None, return_overlay=False, camera=None):
         """
         Render the wall mesh.
@@ -360,6 +387,114 @@ class Wall(nn.Module):
         
         return rendered_img
     
+    def render_with_smpl(self, wall_vertices, smpl_vertices, smpl_faces, 
+                        wall_colors=None, smpl_color=None, 
+                        camera=None, return_overlay=False):
+        """
+        Render the wall mesh with SMPL model overlayed.
+        
+        NOTE: SMPL vertices should be in the SAME coordinate system as your wall!
+        If using GVHMR incam output, the vertices are already in camera space.
+        
+        Args:
+            wall_vertices: (num_vertices, 3) or (1, num_vertices, 3) wall vertices
+            smpl_vertices: (num_vertices, 3) or (1, num_vertices, 3) SMPL vertices 
+                          IN THE SAME COORDINATE SYSTEM AS WALL
+            smpl_faces: (num_faces, 3) SMPL faces tensor
+            wall_colors: Optional vertex colors for wall. If None, uses default segmentation colors
+            smpl_color: Optional color for SMPL model (3,) RGB. If None, uses skin tone [0.8, 0.6, 0.5]
+            camera: Optional custom camera. If None, uses default camera
+            return_overlay: If True, returns overlay with original image
+        
+        Returns:
+            rendered_img: (H, W, 3) rendered image with both meshes
+        """
+        from pytorch3d.renderer import (
+            RasterizationSettings,
+            MeshRenderer,
+            MeshRasterizer,
+            HardPhongShader
+        )
+        
+        # Handle single vertex input
+        if wall_vertices.dim() == 2:
+            wall_vertices = wall_vertices.unsqueeze(0)
+        if smpl_vertices.dim() == 2:
+            smpl_vertices = smpl_vertices.unsqueeze(0)
+        
+        # Ensure SMPL vertices are on correct device
+        smpl_vertices = smpl_vertices.to(self.device)
+        smpl_faces = smpl_faces.to(self.device)
+        
+        batch_size = 1  # Single frame rendering
+        
+        # Prepare wall colors
+        if wall_colors is None:
+            vertex_colors_np = self.color_palette[self.vertex_regions]
+            wall_colors = torch.from_numpy(vertex_colors_np).float().to(self.device)
+            wall_colors = wall_colors.unsqueeze(0)
+        
+        # Prepare SMPL colors
+        if smpl_color is None:
+            # Default skin tone
+            smpl_color = torch.tensor([0.8, 0.6, 0.5], device=self.device)
+        else:
+            smpl_color = torch.tensor(smpl_color, device=self.device)
+        
+        num_smpl_verts = smpl_vertices.shape[1]
+        smpl_colors = smpl_color.unsqueeze(0).unsqueeze(0).expand(batch_size, num_smpl_verts, 3)
+        
+        # Combine meshes
+        combined_verts = torch.cat([wall_vertices, smpl_vertices], dim=1)
+        combined_colors = torch.cat([wall_colors, smpl_colors], dim=1)
+        
+        # Adjust SMPL faces indices to account for wall vertices
+        num_wall_verts = wall_vertices.shape[1]
+        smpl_faces_adjusted = smpl_faces + num_wall_verts
+        
+        combined_faces = torch.cat([self.faces.unsqueeze(0), smpl_faces_adjusted.unsqueeze(0)], dim=1)
+        
+        # Create combined mesh
+        textures = TexturesVertex(verts_features=combined_colors)
+        meshes = Meshes(verts=combined_verts, faces=combined_faces, textures=textures)
+        
+        # Use custom camera if provided
+        cam = camera if camera is not None else self.camera
+        lights = self.lights
+        
+        # Rasterization settings
+        raster_settings = RasterizationSettings(
+            image_size=(self.H, self.W),
+            blur_radius=0.0,
+            faces_per_pixel=1,
+            bin_size=None,
+            max_faces_per_bin=1000000
+        )
+        
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(
+                cameras=cam,
+                raster_settings=raster_settings
+            ),
+            shader=HardPhongShader(
+                device=self.device,
+                cameras=cam,
+                lights=lights
+            )
+        )
+        
+        rendered = renderer(meshes)
+        rendered_img = rendered[..., :3].clamp(0.0, 1.0)
+        
+        if return_overlay:
+            # Create overlay with original image
+            alpha = 0.5
+            wall_img_tensor = torch.from_numpy(self.wall_img).float().to(self.device) / 255.0
+            overlay = alpha * wall_img_tensor + (1 - alpha) * rendered_img[0]
+            return overlay
+        
+        return rendered_img[0]
+    
     def render_angled_view(self, vertices, azimuth=30, elevation=45, distance=3.0, 
                           colors=None, camera=None):
         """
@@ -410,6 +545,69 @@ class Wall(nn.Module):
         rendered = self.render(vertices, colors=colors, camera=camera_angled)
         
         return rendered[0]
+    
+    def render_angled_view_with_smpl(self, wall_vertices, smpl_vertices, smpl_faces,
+                                    azimuth=30, elevation=45, distance=3.0,
+                                    wall_colors=None, smpl_color=None):
+        """
+        Render the wall with SMPL from an angled perspective view.
+        
+        NOTE: SMPL vertices should be in the SAME coordinate system as your wall!
+        
+        Args:
+            wall_vertices: (num_vertices, 3) or (1, num_vertices, 3) wall vertices
+            smpl_vertices: (num_vertices, 3) or (1, num_vertices, 3) SMPL vertices
+                          IN THE SAME COORDINATE SYSTEM AS WALL
+            smpl_faces: (num_faces, 3) SMPL faces tensor
+            azimuth: Horizontal rotation angle in degrees
+            elevation: Vertical angle in degrees
+            distance: Camera distance from mesh center
+            wall_colors: Optional vertex colors for wall
+            smpl_color: Optional color for SMPL model
+        
+        Returns:
+            rendered_img: (H, W, 3) rendered image
+        """
+        from pytorch3d.renderer import look_at_view_transform, PerspectiveCameras
+        
+        # Handle single vertex input
+        if wall_vertices.dim() == 2:
+            wall_vertices = wall_vertices.unsqueeze(0)
+        if smpl_vertices.dim() == 2:
+            smpl_vertices = smpl_vertices.unsqueeze(0)
+        
+        # Get mesh center for camera to look at (use wall center)
+        mesh_center = wall_vertices[0].mean(dim=0)
+        
+        # Create camera at specified viewpoint
+        R, T = look_at_view_transform(
+            dist=distance,
+            elev=elevation,
+            azim=azimuth,
+            at=((mesh_center[0].item(), mesh_center[1].item(), mesh_center[2].item()),),
+            device=self.device
+        )
+        
+        # Create camera with perspective projection
+        fx, fy = 2000, 2000
+        camera_angled = PerspectiveCameras(
+            focal_length=((fx, fy),),
+            principal_point=((self.W/2, self.H/2),),
+            R=R,
+            T=T,
+            image_size=((self.H, self.W),),
+            in_ndc=False,
+            device=self.device
+        )
+        
+        # Render from this viewpoint with SMPL
+        rendered = self.render_with_smpl(
+            wall_vertices, smpl_vertices, smpl_faces,
+            wall_colors=wall_colors, smpl_color=smpl_color,
+            camera=camera_angled
+        )
+        
+        return rendered
     
     def render_rotating_view(self, vertices, num_frames=24, elevation=15, distance=3.0, 
                             colors=None, output_path='rotation.gif', fps=8):
@@ -562,96 +760,9 @@ class Wall(nn.Module):
         
         print(f"  ✓ Saved mesh: {output_path}")
 
-def find_alignment_transform(wall, wall_vertices, smpl_vertices, gvhmr_K):
-    """
-    Find the transformation that aligns SMPL with wall by matching their projections.
-    
-    Strategy: Since both mesh projections are correct in their own systems,
-    we need to find the transform T such that:
-    - wall_camera.project(wall_verts) and wall_camera.project(T @ smpl_verts) 
-      give the same image coordinates
-    """
-    import cv2
-    
-    # Step 1: Get GVHMR projection (ground truth for where SMPL should appear)
-    smpl_verts_np = smpl_vertices[0].cpu().numpy()
-    gvhmr_K_np = gvhmr_K[0].cpu().numpy()
-    
-    # Project using GVHMR's camera
-    projected_gvhmr = (gvhmr_K_np @ smpl_verts_np.T).T
-    u_gvhmr = projected_gvhmr[:, 0] / projected_gvhmr[:, 2]
-    v_gvhmr = projected_gvhmr[:, 1] / projected_gvhmr[:, 2]
-    
-    # Step 2: We need SMPL in wall's coordinate system such that
-    # wall_camera projects it to the same (u_gvhmr, v_gvhmr)
-    
-    # Get wall's camera matrix
-    wall_K = wall._get_intrinsics(wall.H, wall.W)
-    
-    # The key insight: we need to solve for the 3D position in wall's coordinate
-    # system that projects to (u_gvhmr, v_gvhmr)
-    
-    # For a sample of correspondences, we can estimate the transformation
-    # Let's use the SMPL body center as a reference point
-    
-    smpl_center_gvhmr = smpl_verts_np.mean(axis=0)  # (3,)
-    
-    # Project to image using GVHMR
-    p_gvhmr = gvhmr_K_np @ smpl_center_gvhmr
-    u_center = p_gvhmr[0] / p_gvhmr[2]
-    v_center = p_gvhmr[1] / p_gvhmr[2]
-    
-    print(f"\nSMPL center projects to: ({u_center:.1f}, {v_center:.1f})")
-    
-    # Now, we need to find the 3D point in wall's coordinate system that projects there
-    # Use depth from wall mesh at that location to estimate scale
-    
-    # Find wall vertices that project near the SMPL center
-    wall_verts_np = wall_vertices[0].cpu().numpy()
-    points_screen = wall.camera.transform_points_screen(
-        wall_vertices, 
-        image_size=((wall.H, wall.W),)
-    )[0].cpu().numpy()
-    
-    u_wall = points_screen[:, 0]
-    v_wall = points_screen[:, 1]
-    z_wall = wall_verts_np[:, 2]  # Depth in wall coordinates
-    
-    # Find wall depth at SMPL center location
-    dist_to_center = (u_wall - u_center)**2 + (v_wall - v_center)**2
-    nearest_idx = np.argmin(dist_to_center)
-    reference_depth_wall = z_wall[nearest_idx]
-    
-    print(f"Wall depth at SMPL location: {reference_depth_wall:.3f}")
-    print(f"SMPL depth in GVHMR coords: {smpl_center_gvhmr[2]:.3f}")
-    
-    # Step 3: Compute transformation
-    # We know: GVHMR convention is [X, Y, Z] with Z forward
-    # We need to find what [X', Y', Z'] in wall coords corresponds to same image point
-    
-    # Unproject SMPL center using GVHMR camera
-    ray_gvhmr = np.linalg.inv(gvhmr_K_np) @ np.array([u_center, v_center, 1.0])
-    point_3d_gvhmr = ray_gvhmr * smpl_center_gvhmr[2]  # Scale by depth
-    
-    # Unproject same image point using wall camera at wall's depth
-    ray_wall = np.linalg.inv(wall_K) @ np.array([u_center, v_center, 1.0])
-    point_3d_wall = ray_wall * reference_depth_wall
-    
-    print(f"\nSame image point maps to:")
-    print(f"  GVHMR 3D: {point_3d_gvhmr}")
-    print(f"  Wall 3D:  {point_3d_wall}")
-    
-    # The transformation is: rotation + scale + translation
-    # Scale factor
-    scale = reference_depth_wall / smpl_center_gvhmr[2]
-    
-    print(f"\nEstimated scale: {scale:.4f}")
-    
-    return scale, point_3d_gvhmr, point_3d_wall
-
 
 def example_usage():
-    """Example usage of Wall class"""
+    """Example usage of Wall class with SMPL overlay"""
 
     os.makedirs('output_examples', exist_ok=True)
     
@@ -665,143 +776,64 @@ def example_usage():
     # Example 1: Forward pass with zero angles
     print("\n--- Example 1: Zero angles (neutral pose) ---")
     angles_zero = wall.get_zero_angles(batch_size=1)
-    wall_vertices = wall.forward(angles_zero)
-    print(f"Output vertices shape: {wall_vertices.shape}")
-
-    # Load SMPL parameters
+    vertices = wall.forward(angles_zero)
+    print(f"Output vertices shape: {vertices.shape}")
+    
+    # Load SMPL model and parameters
+    print("\n--- Loading SMPL model ---")
     smpl_param_path = '/home/kunwoo/Kunwoo/GVHMR/outputs/ascendmotion_merged/20240927JimeiYanwu_WJY_001/merged_smpl_params.pt'
-    smpl_params = torch.load(smpl_param_path)
-    mid_frame = smpl_params['body_pose'].shape[0] // 2
-    smpl_params = {k: v[mid_frame:mid_frame+1] for k, v in smpl_params.items()}
-
-    # Create SMPL body model
+    smpl_params = torch.load(smpl_param_path, weights_only=False)
+    
+    # GVHMR outputs both 'global' and 'incam' parameters
+    # 'incam' contains camera-space SMPL params (OpenCV convention)
+    # 'global' contains world-space params
+    
+    print("Available keys:", smpl_params.keys())
+    
+    # Use 'incam' parameters which are in camera coordinates
+    if 'incam' in smpl_params:
+        print("Using 'incam' (camera-space) parameters from GVHMR")
+        smpl_params_cam = smpl_params['incam']
+    else:
+        # Fallback to root-level params if incam not available
+        print("Warning: 'incam' not found, using root-level parameters")
+        smpl_params_cam = smpl_params
+    
+    # Take the middle frame for visualization
+    mid_frame = smpl_params_cam['body_pose'].shape[0] // 2
+    smpl_params_single = {k: v[mid_frame:mid_frame+1].to(wall.device) 
+                         for k, v in smpl_params_cam.items()}
+    
     import smplx
     body_model = smplx.create(
         model_path="smpl_models",
         model_type="smpl",
         gender='male',
         ext="pkl",
-    ).eval()
+    ).eval().to(wall.device)
     
     with torch.no_grad():
-        smpl_output = body_model(**smpl_params)
-        smpl_vertices = smpl_output.vertices.to(wall.device)
-        smpl_faces = body_model.faces_tensor.to(wall.device)
-
-    gvhmr_K = smpl_params['K_fullimg']
+        smpl_output = body_model(**smpl_params_single)
+        smpl_vertices = smpl_output.vertices  # In OpenCV camera coords (will be converted in render)
+        smpl_faces = body_model.faces_tensor
     
-    # Find the alignment transformation
-    print("\n" + "="*60)
-    print("FINDING ALIGNMENT TRANSFORMATION")
-    print("="*60)
-    scale, point_gvhmr, point_wall = find_alignment_transform(
-        wall, wall_vertices, smpl_vertices, gvhmr_K
+    print(f"SMPL vertices shape: {smpl_vertices.shape}")
+    print(f"SMPL faces shape: {smpl_faces.shape}")
+    print("Note: SMPL vertices are in OpenCV camera coordinates and will be")
+    print("      automatically converted to PyTorch3D coordinates during rendering.")
+    
+    # Example 2: Render wall with SMPL overlay (frontal view)
+    print("\n--- Example 2: Wall + SMPL (frontal view) ---")
+    rendered_with_smpl = wall.render_with_smpl(
+        vertices[0], 
+        smpl_vertices,
+        smpl_faces,
+        smpl_color=[0.85, 0.65, 0.55]  # Skin tone
     )
-    
-    # Apply transformation
-    # 1. Apply that mystery T matrix that works for wall
-    T_mat = torch.tensor([[-1, 0, 0], 
-                          [0, 0, -1], 
-                          [0, -1, 0]], dtype=torch.float32, device=wall.device)
-    smpl_verts_transformed = torch.matmul(smpl_vertices, T_mat.T)
-    
-    # 2. Apply scale
-    smpl_verts_transformed = smpl_verts_transformed * scale
-    
-    # 3. Verify projection
-    points_screen_smpl = wall.camera.transform_points_screen(
-        smpl_verts_transformed, 
-        image_size=((wall.H, wall.W),)
-    )[0].cpu().numpy()
-    
-    u_smpl = points_screen_smpl[:, 0]
-    v_smpl = points_screen_smpl[:, 1]
-    
-    print(f"\n" + "="*60)
-    print("VERIFICATION")
-    print("="*60)
-    print(f"SMPL projection in wall camera:")
-    print(f"  u range: [{u_smpl.min():.1f}, {u_smpl.max():.1f}]")
-    print(f"  v range: [{v_smpl.min():.1f}, {v_smpl.max():.1f}]")
-    
-    # Compare with GVHMR projection
-    smpl_verts_np = smpl_vertices[0].cpu().numpy()
-    gvhmr_K_np = gvhmr_K[0].cpu().numpy()
-    projected_gvhmr = (gvhmr_K_np @ smpl_verts_np.T).T
-    u_gvhmr = projected_gvhmr[:, 0] / projected_gvhmr[:, 2]
-    v_gvhmr = projected_gvhmr[:, 1] / projected_gvhmr[:, 2]
-    
-    print(f"SMPL projection in GVHMR camera (ground truth):")
-    print(f"  u range: [{u_gvhmr.min():.1f}, {u_gvhmr.max():.1f}]")
-    print(f"  v range: [{v_gvhmr.min():.1f}, {v_gvhmr.max():.1f}]")
-    
-    # Should match!
-    print(f"\nProjection match: {np.allclose(u_smpl, u_gvhmr, atol=10) and np.allclose(v_smpl, v_gvhmr, atol=10)}")
-
-    # Render
-    wall_colors = torch.from_numpy(
-        wall.color_palette[wall.vertex_regions]
-    ).float().to(wall.device).unsqueeze(0)
-    
-    smpl_colors = torch.ones_like(smpl_verts_transformed) * torch.tensor(
-        [1.0, 0.7, 0.7], device=wall.device
-    )
-    
-    from pytorch3d.structures import Meshes, join_meshes_as_scene
-    from pytorch3d.renderer import TexturesVertex
-    
-    wall_mesh = Meshes(
-        verts=[wall_vertices[0]],
-        faces=[wall.faces],
-        textures=TexturesVertex(verts_features=[wall_colors[0]])
-    )
-    
-    smpl_mesh = Meshes(
-        verts=[smpl_verts_transformed[0]],
-        faces=[smpl_faces],
-        textures=TexturesVertex(verts_features=[smpl_colors[0]])
-    )
-    
-    combined_mesh = join_meshes_as_scene([wall_mesh, smpl_mesh])
-    
-    from pytorch3d.renderer import (
-        RasterizationSettings,
-        MeshRenderer,
-        MeshRasterizer,
-        HardPhongShader
-    )
-    
-    raster_settings = RasterizationSettings(
-        image_size=(wall.H, wall.W),
-        blur_radius=0.0,
-        faces_per_pixel=1,
-        bin_size=None,
-        max_faces_per_bin=1000000
-    )
-    
-    renderer = MeshRenderer(
-        rasterizer=MeshRasterizer(
-            cameras=wall.camera,
-            raster_settings=raster_settings
-        ),
-        shader=HardPhongShader(
-            device=wall.device,
-            cameras=wall.camera,
-            lights=wall.lights
-        )
-    )
-    
-    rendered = renderer(combined_mesh)
-    rendered_img = rendered[..., :3].clamp(0.0, 1.0)
-    
-    alpha = 0.5
-    wall_img_tensor = torch.from_numpy(wall.wall_img).float().to(wall.device) / 255.0
-    overlay = alpha * wall_img_tensor + (1 - alpha) * rendered_img[0]
-    
-    rendered_np = (overlay.cpu().numpy() * 255).astype(np.uint8)
-    imageio.imwrite('output_examples/wall_smpl_combined.png', rendered_np)
-    print("\n✓ Saved: output_examples/wall_smpl_combined.png")
+    rendered_with_smpl_np = (rendered_with_smpl.cpu().numpy() * 255).astype(np.uint8)
+    imageio.imwrite('output_examples/wall_with_smpl_frontal.png', rendered_with_smpl_np)
+    print("  ✓ Saved: output_examples/wall_with_smpl_frontal.png")
     
 if __name__ == "__main__":
-    print('TESTING WALL PARAMETERIZATION MODULE...')
+    print('TESTING WALL PARAMETERIZATION MODULE WITH SMPL OVERLAY...')
     example_usage()
