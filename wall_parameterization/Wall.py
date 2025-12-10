@@ -579,7 +579,6 @@ def example_usage():
     angles_zero = wall.get_zero_angles(batch_size=1)
     vertices = wall.forward(angles_zero)
     print(f"Output vertices shape: {vertices.shape}")
-    vertices_zero = vertices.clone()
     
     # Render frontal view
     rendered = wall.render(vertices)
@@ -628,4 +627,5 @@ def example_usage():
 
 
 if __name__ == "__main__":
+    print('TESTING WALL PARAMETERIZATION MODULE...')
     example_usage()
