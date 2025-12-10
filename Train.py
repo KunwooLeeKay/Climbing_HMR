@@ -279,8 +279,7 @@ def main():
 
     # 3. Load Data
     print("\nLOADING DATA...")
-    wall1_sessions = ['20240927JimeiYanwu_WJY_001_images', '20240927JimeiYanwu_WJY_002_images', '20240927JimeiYanwu_WJY_003_images', '20240927JimeiYanwu_WJY_004_images', '20240927JimeiYanwu_WJY_005_images']
-    training_sessions = wall1_sessions[:-1]
+    training_sessions = sorted(os.listdir('ascendmotion_merged'))
     
     data = []
     for s in training_sessions:
