@@ -228,13 +228,12 @@ def main():
     print("LOADING DATA")
     print("="*60)
     
-    # [Insert your Path Loading Logic Here - condensed for brevity]
-    # Assuming you still have the logic to find `training_sessions`
-    # ... (Same as your original code) ...
     
-    video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
-    training_sessions_dirs = [s for s in os.listdir(video_path) if s.endswith('_images')]
-    wall1_sessions = [s for s in training_sessions_dirs if s.startswith('20240927') and 'WJY' in s]
+    # video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
+    # training_sessions_dirs = [s for s in os.listdir(video_path) if s.endswith('_images')]
+    # wall1_sessions = [s for s in training_sessions_dirs if s.startswith('20240927') and 'WJY' in s]
+    wall1_sessions = ['20240927JimeiYanwu_WJY_001_images', '20240927JimeiYanwu_WJY_002_images', '20240927JimeiYanwu_WJY_003_images', '20240927JimeiYanwu_WJY_004_images', '20240927JimeiYanwu_WJY_005_images']
+
     
     # Let's pick ONE session to optimize for this example
     # Optimization is usually done per-sequence
@@ -246,10 +245,7 @@ def main():
     # Load SMPL Params
     smpl_path = f'/home/kunwoo/Kunwoo/GVHMR/outputs/ascendmotion_merged/{session_dir}/merged_smpl_params.pt'
     smpl_params = torch.load(smpl_path, map_location=device)
-    
-    # Normalize Shapes (Ensure (N, 69) etc using your original logic)
-    # ... [Insert your shape checking/reshaping logic from original code] ...
-    # For brevity, assuming smpl_params are correctly shaped on device now.
+
     
     # ========================================================================
     # 2. Initialize Models

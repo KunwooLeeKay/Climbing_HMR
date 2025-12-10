@@ -278,8 +278,8 @@ class ClimbingMocapTrainer:
         smpl_params_refined['betas'] = betas
         
         # 3. Forward SMPL to get vertices (in GVHMR coordinates)
-        # Process in batches to avoid OOM
-        batch_size = 32
+        # Process in smaller batches to avoid OOM
+        batch_size = 16  # Reduced from 32 for memory efficiency
         vertices_list = []
         
         for i in range(0, num_frames, batch_size):
@@ -307,7 +307,8 @@ class ClimbingMocapTrainer:
                     depth_weight=1.0,
                     penetration_weight=10.0,
                     reg_wall_weight=0.1,
-                    reg_smpl_weight=0.01):
+                    reg_smpl_weight=0.01,
+                    frame_batch_size=64):  # Process frames in batches for memory efficiency
         """
         Compute total loss with regularization.
         
@@ -324,6 +325,7 @@ class ClimbingMocapTrainer:
             penetration_weight: Weight for penetration loss
             reg_wall_weight: Weight for wall regularization
             reg_smpl_weight: Weight for SMPL regularization
+            frame_batch_size: Number of frames to process at once for memory efficiency
         
         Returns:
             total_loss: scalar
@@ -332,15 +334,47 @@ class ClimbingMocapTrainer:
         # Get wall vertices (remove batch dim)
         wall_verts = vertices_wall[0] if vertices_wall.dim() == 3 else vertices_wall
         
-        # 1. Main losses (contact, depth, penetration)
-        main_loss, losses_dict = self.loss_fn(
-            smpl_vertices=vertices_SMPL,
-            wall_vertices=wall_verts,
-            lidar_points=lidar_points,
-            contact_weight=contact_weight,
-            depth_weight=depth_weight,
-            penetration_weight=penetration_weight
+        # 1. Main losses (contact, depth, penetration) - process in batches
+        num_frames = vertices_SMPL.shape[0]
+        total_contact_loss = 0.0
+        total_penetration_loss = 0.0
+        total_depth_loss = 0.0
+        
+        num_batches = (num_frames + frame_batch_size - 1) // frame_batch_size
+        
+        for i in range(0, num_frames, frame_batch_size):
+            end = min(i + frame_batch_size, num_frames)
+            batch_smpl_verts = vertices_SMPL[i:end]
+            
+            # Compute losses for this batch
+            batch_main_loss, batch_losses_dict = self.loss_fn(
+                smpl_vertices=batch_smpl_verts,
+                wall_vertices=wall_verts,
+                lidar_points=lidar_points,
+                contact_weight=contact_weight,
+                depth_weight=depth_weight,
+                penetration_weight=penetration_weight
+            )
+            
+            # Accumulate losses (weighted by batch size)
+            batch_weight = (end - i) / num_frames
+            total_contact_loss += batch_losses_dict['contact_loss'] * batch_weight
+            total_penetration_loss += batch_losses_dict['penetration_loss'] * batch_weight
+            if 'depth_loss' in batch_losses_dict:
+                total_depth_loss += batch_losses_dict['depth_loss'] * batch_weight
+        
+        # Combine main losses
+        main_loss = (
+            contact_weight * total_contact_loss + 
+            penetration_weight * total_penetration_loss +
+            depth_weight * total_depth_loss
         )
+        
+        losses_dict = {
+            'contact_loss': total_contact_loss,
+            'penetration_loss': total_penetration_loss,
+            'depth_loss': total_depth_loss
+        }
         
         # 2. Regularization: keep parameters close to initial values
         # Wall angle regularization
@@ -395,7 +429,7 @@ class ClimbingMocapTrainer:
             vertices_SMPL, vertices_wall, wall_angles_refined, smpl_params_refined = \
                 self.forward_pass(smpl_params_init, self.wall_angles_init, betas)
             
-            # Compute loss
+            # Compute loss (process frames in batches for memory efficiency)
             total_loss, losses_dict = self.compute_loss(
                 vertices_SMPL, vertices_wall,
                 wall_angles_refined, self.wall_angles_init,
@@ -405,7 +439,8 @@ class ClimbingMocapTrainer:
                 depth_weight=depth_weight,
                 penetration_weight=penetration_weight,
                 reg_wall_weight=reg_wall_weight,
-                reg_smpl_weight=reg_smpl_weight
+                reg_smpl_weight=reg_smpl_weight,
+                frame_batch_size=32  # Process 32 frames at a time
             )
             
             # Backward pass
@@ -417,6 +452,10 @@ class ClimbingMocapTrainer:
                 torch.nn.utils.clip_grad_norm_(self.smpl_mlp.parameters(), max_norm=1.0)
             
             optimizer.step()
+            
+            # Clear intermediate tensors to free memory
+            del vertices_SMPL, vertices_wall, wall_angles_refined, smpl_params_refined
+            torch.cuda.empty_cache()
             
             # Log
             epoch_losses.append(total_loss.item())
@@ -446,7 +485,7 @@ class ClimbingMocapTrainer:
                 vertices_SMPL, vertices_wall, wall_angles_refined, smpl_params_refined = \
                     self.forward_pass(smpl_params_init, self.wall_angles_init, betas)
                 
-                # Compute loss
+                # Compute loss (process frames in batches for memory efficiency)
                 total_loss, losses_dict = self.compute_loss(
                     vertices_SMPL, vertices_wall,
                     wall_angles_refined, self.wall_angles_init,
@@ -455,7 +494,8 @@ class ClimbingMocapTrainer:
                     depth_weight=depth_weight,
                     penetration_weight=penetration_weight,
                     reg_wall_weight=0.0,  # No regularization in validation
-                    reg_smpl_weight=0.0
+                    reg_smpl_weight=0.0,
+                    frame_batch_size=32  # Process 32 frames at a time
                 )
                 
                 val_losses.append(total_loss.item())
@@ -515,10 +555,12 @@ def main():
     print("LOADING DATA")
     print("="*60)
     
-    video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
-    training_sessions_dirs = [s for s in os.listdir(video_path) if s.endswith('_images')]
-    wall1_sessions = [s for s in training_sessions_dirs if s.startswith('20240927')]
-    wall1_sessions = [s for s in wall1_sessions if 'WJY' in s]  # Filter
+    # video_path = '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D'
+    # training_sessions_dirs = [s for s in os.listdir(video_path) if s.endswith('_images')]
+    # wall1_sessions = [s for s in training_sessions_dirs if s.startswith('20240927')]
+    # wall1_sessions = [s for s in wall1_sessions if 'WJY' in s]  # Filter
+    wall1_sessions = ['20240927JimeiYanwu_WJY_001_images', '20240927JimeiYanwu_WJY_002_images', '20240927JimeiYanwu_WJY_003_images', '20240927JimeiYanwu_WJY_004_images', '20240927JimeiYanwu_WJY_005_images']
+
     
     # Split train/test
     training_sessions = wall1_sessions[:-1]
@@ -534,7 +576,7 @@ def main():
         gender='male',
         use_pca=False,
         ext="pkl",
-        batch_size=32
+        batch_size=16  # Reduced from 32 for memory efficiency
     ).to(device).eval()  # Set to eval mode
     
     # Load SMPL parameters for all sessions
