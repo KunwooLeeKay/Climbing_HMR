@@ -30,14 +30,17 @@ from wall_parameterization.Wall import Wall
 from pdb import set_trace as st
 
 # ============================================================================
-# 1. Visualization Function (The "Verify" Step)
+# 1. Visualization Function (Updated for Training Loop)
 # ============================================================================
 
-def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, output_path="verification_alignment.mp4"):
+def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, output_path="verification_alignment.mp4", refined_verts=None):
     """
     Generates a video verifying the alignment between SMPL and Wall.
+    Args:
+        refined_verts: (Optional) Tensor of shape (N, 6890, 3). If provided, these vertices are rendered 
+                       instead of generating them from the initial SMPL params.
     """
-    print(f"\nGeneratng verification video: {output_path}...")
+    print(f"\nGenerating video: {output_path}...")
     
     # Unpack session data
     smpl_params = session_data['smpl_params']
@@ -54,7 +57,7 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
     # 2. Setup Wall Reference for Texture & K Scaling
     wall_ref_img = cv2.imread('wall1.png')
     if wall_ref_img is None:
-        print("Warning: wall1.png not found. Using solid color for wall.")
+        # print("Warning: wall1.png not found. Using solid color for wall.")
         H_ref, W_ref = H_vid, W_vid
         use_texture = False
     else:
@@ -105,7 +108,6 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
         textures_wall = TexturesVertex(verts_features=verts_rgb.unsqueeze(0))
 
     # 5. Create Wall Mesh
-    # Use lists for both verts and faces
     mesh_wall = Meshes(verts=[verts_wall_cam], faces=[wall_obj.faces], textures=textures_wall)
     
     # 6. Renderer
@@ -127,28 +129,38 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
     # 7. Render Loop
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (W_vid, H_vid))
     
-    body_model = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', ext="pkl").to(device).eval()
-    
-    with torch.no_grad():
-        N_vis = min(100, len(images))
-        params_vis = {k: v[:N_vis] for k, v in smpl_params.items() if k in ['body_pose', 'global_orient', 'transl', 'betas']}
-        verts_smpl = body_model(**params_vis).vertices
+    # Decide which vertices to use
+    if refined_verts is not None:
+        verts_smpl = refined_verts
+        N_vis = min(100, len(verts_smpl))
+    else:
+        body_model = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', ext="pkl").to(device).eval()
+        with torch.no_grad():
+            N_vis = min(100, len(images))
+            params_vis = {k: v[:N_vis] for k, v in smpl_params.items() if k in ['body_pose', 'global_orient', 'transl', 'betas']}
+            verts_smpl = body_model(**params_vis).vertices
         
-    for i in tqdm(range(N_vis), desc="Rendering Video"):
+    for i in tqdm(range(N_vis), desc="Rendering Video", leave=False):
         bg = cv2.imread(os.path.join(img_dir, images[i]))
         if bg is None: continue
         
         # Render Body
         v_frame = verts_smpl[i]
         
-        # FIX: Ensure color tensor shape is (1, V, 3) for TexturesVertex
         color_tensor = (torch.ones_like(v_frame) * torch.tensor([0.8, 0.2, 0.2], device=device)).unsqueeze(0)
         tex_body = TexturesVertex(verts_features=color_tensor)
         
-        # FIX: Pass faces as a LIST to match verts=[v_frame]
+        # Need dummy face tensor if body model wasn't created in this scope
+        # Use wall_obj.faces or load a dummy model to get faces if necessary
+        # Assuming body_model or similar logic is available to get faces. 
+        # Since faces are constant, we can borrow them from the trainer's model or create a temp one.
+        if 'body_faces_tensor' not in locals():
+             temp_body = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', ext="pkl").to(device)
+             body_faces_tensor = temp_body.faces_tensor
+             
         mesh_body = Meshes(
             verts=[v_frame], 
-            faces=[body_model.faces_tensor], 
+            faces=[body_faces_tensor], 
             textures=tex_body
         )
         
@@ -166,11 +178,11 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
         writer.write(final_bgr.astype(np.uint8))
         
     writer.release()
-    print("✓ Video saved.")
+    print(f"✓ Video saved to {output_path}")
 
 
 # ============================================================================
-# 2. Training Classes (MLP, Dataset, Trainer)
+# 2. Training Classes
 # ============================================================================
 
 class SMPLRefinementMLP(nn.Module):
@@ -232,8 +244,6 @@ class ClimbingMocapTrainer:
             
             verts, params_ref = self.forward_pass(batch['smpl_params'], batch['betas'])
             
-            # Compute Loss
-            # Process in chunks to avoid OOM
             tot_pen = 0; tot_con = 0; tot_loss = 0
             chunk = 64
             for i in range(0, len(verts), chunk):
@@ -243,7 +253,6 @@ class ClimbingMocapTrainer:
                 tot_pen += l_dict['penetration_loss'] * weight
                 tot_con += l_dict['contact_loss'] * weight
             
-            # Reg
             reg = sum(F.mse_loss(params_ref[k], batch['smpl_params'][k]) for k in ['body_pose','global_orient','transl'])
             loss = (kwargs.get('penetration_weight',10)*tot_pen + kwargs.get('contact_weight',1)*tot_con) + 0.01*reg
             
@@ -267,21 +276,17 @@ def main():
     device = 'cuda'
     print("="*60 + "\nINITIALIZING WALL & ALIGNMENT\n" + "="*60)
     
-    # 1. Init Wall
     wall = Wall('single_view.ply', 'wall1.png', 'wall_mesh_segments.npy', device=device)
     verts_local = wall.forward(torch.zeros(1, wall.num_segments*2, device=device))[0]
     
-    # 2. Align (R_wc)
     R_wc = torch.tensor([[-1, 0, 0, 0.], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 1]], device=device).float()
     verts_h = torch.cat([verts_local, torch.ones((len(verts_local), 1), device=device)], 1)
     verts_wall_cam = (R_wc @ verts_h.T).T[:, :3]
     print(f"✓ Wall aligned. Vertices: {verts_wall_cam.shape}")
 
-    # 3. Load Data
     print("\nLOADING DATA...")
     training_sessions = sorted(os.listdir('ascendmotion_merged'))
     training_sessions = training_sessions[:-1]
-    test_session = training_sessions[-1]
     
     data = []
     for s in training_sessions:
@@ -290,46 +295,59 @@ def main():
         params = torch.load(p, map_location='cpu')
         params = {k: v.to(device) for k,v in params.items()}
         
-        # Norm params
         if params['body_pose'].dim() == 4: params['body_pose'] = matrix_to_axis_angle(params['body_pose'].reshape(-1,3,3)).reshape(len(params['body_pose']),-1)
         elif params['body_pose'].dim() == 3: params['body_pose'] = params['body_pose'].reshape(len(params['body_pose']),-1)
-        
         if params['global_orient'].dim() >= 3: 
              params['global_orient'] = matrix_to_axis_angle(params['global_orient'].reshape(-1,3,3)).reshape(len(params['global_orient']),-1)
 
         data.append({'smpl_params': params, 'betas': params.get('betas', torch.zeros(len(params['body_pose']), 10, device=device)), 'session_name': s.replace("_images",""), 'gvhmr_K': params['K_fullimg']})
         print(f"  ✓ {s}")
 
-    # # 4. VISUALIZATION STEP
-    # print("\n" + "="*60 + "\nVERIFYING ALIGNMENT (VIDEO)\n" + "="*60)
-    # if len(data) > 0:
-    #     verify_alignment_video(data[0], wall, verts_wall_cam, device)
-    # else:
-    #     print("No data loaded, skipping visualization.")
-
-    # 5. Training
     print("\n" + "="*60 + "\nSTARTING TRAINING\n" + "="*60)
     body = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', batch_size=16).to(device).eval()
     loss_fn = ClimbingLoss(device=device)
     trainer = ClimbingMocapTrainer(verts_wall_cam, wall.faces, body, loss_fn, device)
     loader = DataLoader(ClimbingMocapDataset(data), batch_size=1, shuffle=True, collate_fn=collate_fn)
     
-    # --- FIX: Initialize MLP and Optimizer BEFORE the loop ---
-    # We grab the first batch manually to initialize the network dimensions
+    # Init Optimizer
     first_batch = next(iter(loader))
-    # Dummy pass to create trainer.smpl_mlp
     trainer.forward_pass(first_batch['smpl_params'], first_batch['betas'])
-    
-    # Now we can safely create the optimizer because trainer.smpl_mlp is not None
     opt = optim.Adam(trainer.smpl_mlp.parameters(), lr=1e-4)
-    print("✓ Optimizer initialized with MLP parameters.")
-    # ---------------------------------------------------------
+    print("✓ Optimizer initialized.")
+    
+    # Logging
+    log_path = "training_log.txt"
+    with open(log_path, "w") as f: f.write("Epoch, Loss\n")
     
     Path('checkpoints').mkdir(exist_ok=True)
+    
+    # --- TRAINING LOOP ---
     for ep in range(50):
         loss = trainer.train_epoch(loader, opt, ep, contact_weight=1.0, penetration_weight=10.0)
         print(f"  Ep {ep}: {loss:.4f}")
+        
+        with open(log_path, "a") as f: f.write(f"{ep}, {loss:.6f}\n")
+        
         if (ep+1)%10==0: trainer.save(f'checkpoints/cp_{ep+1}.pt', ep, opt, loss)
+        
+        # --- VIDEO SAVING EVERY 20 ITERATIONS ---
+        if (ep + 1) % 20 == 0:
+            print(f"\nCreating visualization for Epoch {ep}...")
+            # Pick the first session (data[0]) to visualize consistency
+            vis_sample = data[0]
+            with torch.no_grad():
+                # Get REFINED vertices using the current trained MLP
+                refined_verts, _ = trainer.forward_pass(vis_sample['smpl_params'], vis_sample['betas'])
+                
+            verify_alignment_video(
+                session_data=vis_sample, 
+                wall_obj=wall, 
+                verts_wall_cam=verts_wall_cam, 
+                device=device,
+                output_path=f"checkpoints/vis_epoch_{ep}.mp4",
+                refined_verts=refined_verts
+            )
+        # ----------------------------------------
 
 if __name__ == "__main__":
     main()
