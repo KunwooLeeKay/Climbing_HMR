@@ -45,6 +45,7 @@ parser.add_argument('--viz_overlay', type=int, help='Sequence index', default=Fa
 parser.add_argument('--dataset_train_dir', type=str, help='Dataset_Train directory path', default = None)
 args = parser.parse_args()
 
+
 DATASET_TRAIN_DIR = args.dataset_train_dir if args.dataset_train_dir is not None else '/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train'
 IMG_DIR = f'{DATASET_TRAIN_DIR}_2D'
 LIDAR_SCALE = 0.22
@@ -292,6 +293,84 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
     print(f"✓ Video saved to {output_path}")
 
 
+def save_meshes_for_sequence(refined_verts, wall_verts, wall_faces, body_faces, output_dir, session_name, device):
+    """
+    Save refined body meshes and wall mesh as OBJ files for visualization.
+    
+    Args:
+        refined_verts: Tensor of shape (N, 6890, 3) - refined body vertices
+        wall_verts: Tensor of shape (W, 3) - wall vertices
+        wall_faces: Tensor of shape (F_wall, 3) - wall faces
+        body_faces: Tensor of shape (F_body, 3) - body faces
+        output_dir: Directory to save meshes
+        session_name: Name of the session
+        device: Device
+    """
+    print(f"\nSaving meshes for {session_name}...")
+    
+    # Create output directory
+    mesh_dir = Path(output_dir) / session_name / "meshes"
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save wall mesh (only once)
+    wall_mesh_path = mesh_dir / "wall.obj"
+    save_obj_mesh(wall_verts.cpu().numpy(), wall_faces.cpu().numpy(), wall_mesh_path)
+    print(f"  ✓ Saved wall mesh: {wall_mesh_path}")
+    
+    # Save body meshes (sample every 10 frames to avoid too many files)
+    num_frames = len(refined_verts)
+    sample_interval = max(1, num_frames // 50)  # Save ~50 frames max
+    
+    for i in tqdm(range(0, num_frames, sample_interval), desc="Saving body meshes"):
+        body_mesh_path = mesh_dir / f"body_frame_{i:04d}.obj"
+        save_obj_mesh(refined_verts[i].cpu().numpy(), body_faces.cpu().numpy(), body_mesh_path)
+    
+    print(f"  ✓ Saved {len(range(0, num_frames, sample_interval))} body meshes")
+    
+    # Also save a combined mesh for the first frame
+    combined_path = mesh_dir / "frame_0000_combined.obj"
+    save_combined_obj(refined_verts[0].cpu().numpy(), body_faces.cpu().numpy(),
+                      wall_verts.cpu().numpy(), wall_faces.cpu().numpy(), combined_path)
+    print(f"  ✓ Saved combined mesh: {combined_path}")
+
+
+def save_obj_mesh(vertices, faces, filepath):
+    """Save a mesh to OBJ file."""
+    with open(filepath, 'w') as f:
+        # Write vertices
+        for v in vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # Write faces (OBJ uses 1-indexed)
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+
+def save_combined_obj(body_verts, body_faces, wall_verts, wall_faces, filepath):
+    """Save body and wall as a single OBJ file."""
+    with open(filepath, 'w') as f:
+        # Write body vertices
+        f.write("# Body vertices\n")
+        for v in body_verts:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # Write wall vertices
+        f.write("# Wall vertices\n")
+        for v in wall_verts:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # Write body faces
+        f.write("# Body faces\n")
+        for face in body_faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+        
+        # Write wall faces (offset by number of body vertices)
+        f.write("# Wall faces\n")
+        offset = len(body_verts)
+        for face in wall_faces:
+            f.write(f"f {face[0]+1+offset} {face[1]+1+offset} {face[2]+1+offset}\n")
+
+
 # ============================================================================
 # 2. Training Classes
 # ============================================================================
@@ -407,7 +486,82 @@ class ClimbingMocapTrainer:
 
 
 # ============================================================================
-# 3. Main Execution
+# 3. Test Session Evaluation Function
+# ============================================================================
+
+def evaluate_test_session(test_data, trainer, wall_obj, verts_wall_cam, device, output_dir="test_results"):
+    """
+    Evaluate the test session and save visualizations.
+    
+    Args:
+        test_data: Dictionary containing test session data
+        trainer: Trained ClimbingMocapTrainer
+        wall_obj: Wall object
+        verts_wall_cam: Wall vertices in camera coordinates
+        device: Device
+        output_dir: Directory to save test results
+    """
+    print("\n" + "="*60)
+    print("EVALUATING TEST SESSION")
+    print("="*60)
+    
+    session_name = test_data['session_name']
+    print(f"Test session: {session_name}")
+    
+    # Create output directory
+    Path(output_dir).mkdir(exist_ok=True)
+    
+    # Get refined vertices using trained model
+    trainer.smpl_mlp.eval()
+    with torch.no_grad():
+        refined_verts, refined_params = trainer.forward_pass(
+            test_data['smpl_params'], 
+            test_data['betas']
+        )
+        
+        # Apply depth scale
+        scale_vec = torch.stack([
+            torch.ones((), device=device), 
+            torch.ones((), device=device), 
+            trainer.depth_scale 
+        ])
+        refined_verts = refined_verts * scale_vec.view(1, 1, 3)
+    
+    print(f"✓ Generated refined vertices: {refined_verts.shape}")
+    
+    # 1. Generate overlay video
+    print("\n1. Generating overlay video...")
+    video_path = f"{output_dir}/{session_name}_overlay.mp4"
+    verify_alignment_video(
+        session_data=test_data,
+        wall_obj=wall_obj,
+        verts_wall_cam=verts_wall_cam,
+        device=device,
+        output_path=video_path,
+        refined_verts=refined_verts
+    )
+    
+    # 2. Save meshes
+    print("\n2. Saving meshes...")
+    body_faces = trainer.body_model.faces_tensor
+    save_meshes_for_sequence(
+        refined_verts=refined_verts,
+        wall_verts=verts_wall_cam,
+        wall_faces=wall_obj.faces,
+        body_faces=body_faces,
+        output_dir=output_dir,
+        session_name=session_name,
+        device=device
+    )
+    
+    print("\n" + "="*60)
+    print(f"TEST EVALUATION COMPLETE")
+    print(f"Results saved to: {output_dir}/{session_name}/")
+    print("="*60)
+
+
+# ============================================================================
+# 4. Main Execution
 # ============================================================================
 
 def main():
@@ -424,16 +578,15 @@ def main():
 
     print("\nLOADING DATA...")
     training_sessions = sorted(os.listdir('ascendmotion_merged'))
-    teseting_sessions = ['20240927JimeiYanwu_YYY_001']
-    training_sessions = [s for s in training_sessions if s not in teseting_sessions]
+    testing_sessions = ['20240927JimeiYanwu_YYY_001']
+    training_sessions = [s for s in training_sessions if s not in testing_sessions]
 
     st()
     
-    data = []
+    # Load training data
+    train_data = []
     for s in training_sessions:
-
         session_name = s.replace('_images','')
-
         p = f'ascendmotion_merged/{s.replace("_images","")}/merged_smpl_params.pt'
         if not os.path.exists(p): continue
         params = torch.load(p, map_location='cpu')
@@ -444,7 +597,6 @@ def main():
         if params['global_orient'].dim() >= 3: 
              params['global_orient'] = matrix_to_axis_angle(params['global_orient'].reshape(-1,3,3)).reshape(len(params['global_orient']),-1)
 
-
         num_frames = len(params['body_pose'])
         
         # Load LiDAR data (frame-aligned: LiDAR frame i matches SMPL frame i)
@@ -453,39 +605,62 @@ def main():
             dataset_train_dir=DATASET_TRAIN_DIR, lidar_scale=LIDAR_SCALE
         )
 
-        data.append({
+        train_data.append({
             'smpl_params': params, 
             'betas': params.get('betas', torch.zeros(num_frames, 10, device=device)), 
             'session_name': session_name, 
             'gvhmr_K': params['K_fullimg'],
-            'lidar_points_by_frame': lidar_points_by_frame  # List: lidar_points_by_frame[i] = LiDAR for frame i
+            'lidar_points_by_frame': lidar_points_by_frame
         })
         print(f"  ✓ {s} ({num_frames} frames)")
+
+    # Load test data
+    test_data = None
+    for s in testing_sessions:
+        session_name = s.replace('_images','')
+        p = f'ascendmotion_merged/{s.replace("_images","")}/merged_smpl_params.pt'
+        if not os.path.exists(p): continue
+        params = torch.load(p, map_location='cpu')
+        params = {k: v.to(device) for k,v in params.items()}
+        
+        if params['body_pose'].dim() == 4: params['body_pose'] = matrix_to_axis_angle(params['body_pose'].reshape(-1,3,3)).reshape(len(params['body_pose']),-1)
+        elif params['body_pose'].dim() == 3: params['body_pose'] = params['body_pose'].reshape(len(params['body_pose']),-1)
+        if params['global_orient'].dim() >= 3: 
+             params['global_orient'] = matrix_to_axis_angle(params['global_orient'].reshape(-1,3,3)).reshape(len(params['global_orient']),-1)
+
+        num_frames = len(params['body_pose'])
+        
+        test_data = {
+            'smpl_params': params, 
+            'betas': params.get('betas', torch.zeros(num_frames, 10, device=device)), 
+            'session_name': session_name, 
+            'gvhmr_K': params['K_fullimg'],
+            'lidar_points_by_frame': None  # No LiDAR for test
+        }
+        print(f"  ✓ TEST: {s} ({num_frames} frames)")
 
     print("\n" + "="*60 + "\nSTARTING TRAINING\n" + "="*60)
     body = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', batch_size=16).to(device).eval()
     loss_fn = ClimbingLoss(device=device)
     trainer = ClimbingMocapTrainer(verts_wall_cam, wall.faces, body, loss_fn, device)
-    loader = DataLoader(ClimbingMocapDataset(data), batch_size=1, shuffle=True, collate_fn=collate_fn)
+    loader = DataLoader(ClimbingMocapDataset(train_data), batch_size=1, shuffle=True, collate_fn=collate_fn)
     
     # Init Optimizer
     first_batch = next(iter(loader))
     trainer.forward_pass(first_batch['smpl_params'], first_batch['betas'])
-    # opt = optim.Adam(trainer.smpl_mlp.parameters(), lr=1e-4)
-    #########################
-    # depth scale
+    
+    # Initialize depth scale
     init_scale = compute_initial_depth_scale(
-        data=data,
+        data=train_data,
         body_model=body,
         verts_wall_cam=verts_wall_cam,
         device=device,
     )
     trainer.depth_scale.data[...] = init_scale
     opt = optim.Adam(
-            list(trainer.smpl_mlp.parameters()) + [trainer.depth_scale],
-            lr=1e-4
-        )
-    ######################
+        list(trainer.smpl_mlp.parameters()) + [trainer.depth_scale],
+        lr=1e-4
+    )
 
     print("✓ Optimizer initialized.")
     
@@ -508,8 +683,8 @@ def main():
             # --- VIDEO SAVING EVERY 20 ITERATIONS ---
             if (ep + 1) % 20 == 0:
                 print(f"\nCreating visualization for Epoch {ep}...")
-                # Pick the first session (data[0]) to visualize consistency
-                vis_sample = data[0]
+                # Pick the first session (train_data[0]) to visualize consistency
+                vis_sample = train_data[0]
                 with torch.no_grad():
                     # Get REFINED vertices using the current trained MLP
                     refined_verts, _ = trainer.forward_pass(vis_sample['smpl_params'], vis_sample['betas'])
@@ -523,6 +698,22 @@ def main():
                     refined_verts=refined_verts
                 )
             # ----------------------------------------
+
+    # --- TEST SESSION EVALUATION ---
+    if test_data is not None:
+        print("\n" + "="*60)
+        print("RUNNING TEST SESSION EVALUATION")
+        print("="*60)
+        evaluate_test_session(
+            test_data=test_data,
+            trainer=trainer,
+            wall_obj=wall,
+            verts_wall_cam=verts_wall_cam,
+            device=device,
+            output_dir="test_results"
+        )
+    else:
+        print("\n⚠ No test data found - skipping test evaluation")
 
 if __name__ == "__main__":
     main()
