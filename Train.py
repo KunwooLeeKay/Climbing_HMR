@@ -687,10 +687,11 @@ def main():
     )
     trainer.depth_scale.data[...] = init_scale
     opt = optim.Adam(
-        list(trainer.smpl_mlp.parameters()) + [trainer.depth_scale],
+        list(trainer.smpl_mlp.parameters()) + 
+        list(trainer.wall_mlp.parameters()) +
+        [trainer.depth_scale],
         lr=1e-4
     )
-
     # Check for existing checkpoints and load the latest one
     start_epoch = 0
     checkpoint_dir = Path('checkpoints')
