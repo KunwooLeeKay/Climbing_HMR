@@ -41,7 +41,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Make argparse object
 parser = argparse.ArgumentParser(description='Run Training')
-parser.add_argument('--viz_overlay', action='store_true', help='Whether to visualize overlay videos during training')
+parser.add_argument('--viz_overlay', type=int, help='Sequence index', default=False)
 parser.add_argument('--dataset_train_dir', type=str, help='Dataset_Train directory path', default = None)
 args = parser.parse_args()
 
@@ -159,8 +159,24 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
     
     # 1. Setup Image Paths
     img_dir = f'{IMG_DIR}/{session_name}_images'
-    img_dir= '.'
-    images = sorted(os.listdir(img_dir))
+    
+    # Check if image directory exists, if not try alternative paths
+    if not os.path.exists(img_dir):
+        # Try without _images suffix
+        img_dir_alt = f'{IMG_DIR}/{session_name}'
+        if os.path.exists(img_dir_alt):
+            img_dir = img_dir_alt
+        else:
+            print(f"Warning: Image directory not found at {img_dir}")
+            print(f"Skipping video generation for {session_name}")
+            return
+    
+    images = sorted([f for f in os.listdir(img_dir) if f.endswith(('.jpg', '.png', '.jpeg'))])
+    
+    if len(images) == 0:
+        print(f"Warning: No images found in {img_dir}")
+        print(f"Skipping video generation for {session_name}")
+        return
     
     # Load first image for resolution
     first_img = cv2.imread(os.path.join(img_dir, images[0]))
@@ -253,8 +269,15 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
             verts_smpl = body_model(**params_vis).vertices
         
     for i in tqdm(range(N_vis), desc="Rendering Video", leave=False):
-        bg = cv2.imread(os.path.join(img_dir, images[i]))
-        if bg is None: continue
+        if i >= len(images):
+            print(f"Warning: Frame {i} exceeds available images ({len(images)})")
+            break
+            
+        img_path = os.path.join(img_dir, images[i])
+        bg = cv2.imread(img_path)
+        if bg is None:
+            print(f"Warning: Could not read image at {img_path}")
+            continue
         
         # Render Body
         v_frame = verts_smpl[i]
@@ -482,7 +505,13 @@ class ClimbingMocapTrainer:
         return np.mean(losses)
     
     def save(self, path, epoch, opt, loss):
-        torch.save({'epoch': epoch, 'mlp': self.smpl_mlp.state_dict(), 'opt': opt.state_dict(), 'loss': loss}, path)
+        torch.save({
+            'epoch': epoch, 
+            'mlp': self.smpl_mlp.state_dict(), 
+            'opt': opt.state_dict(), 
+            'loss': loss,
+            'depth_scale': self.depth_scale.data
+        }, path)
 
 
 # ============================================================================
@@ -581,6 +610,7 @@ def main():
     testing_sessions = ['20240927JimeiYanwu_YYY_001']
     training_sessions = [s for s in training_sessions if s not in testing_sessions]
 
+    st()
     
     # Load training data
     train_data = []
@@ -644,7 +674,7 @@ def main():
     trainer = ClimbingMocapTrainer(verts_wall_cam, wall.faces, body, loss_fn, device)
     loader = DataLoader(ClimbingMocapDataset(train_data), batch_size=1, shuffle=True, collate_fn=collate_fn)
     
-    # Init Optimizer
+    # Init Optimizer and check for checkpoint
     first_batch = next(iter(loader))
     trainer.forward_pass(first_batch['smpl_params'], first_batch['betas'])
     
@@ -661,6 +691,33 @@ def main():
         lr=1e-4
     )
 
+    # Check for existing checkpoints and load the latest one
+    start_epoch = 0
+    checkpoint_dir = Path('checkpoints')
+    if checkpoint_dir.exists():
+        checkpoints = sorted(checkpoint_dir.glob('cp_*.pt'))
+        if checkpoints:
+            latest_checkpoint = checkpoints[-1]
+            print(f"\n✓ Found checkpoint: {latest_checkpoint}")
+            print(f"  Loading checkpoint to resume training...")
+            
+            checkpoint = torch.load(latest_checkpoint, map_location=device)
+            trainer.smpl_mlp.load_state_dict(checkpoint['mlp'])
+            opt.load_state_dict(checkpoint['opt'])
+            start_epoch = checkpoint['epoch'] + 1
+            
+            # Load depth_scale if it exists in checkpoint
+            if 'depth_scale' in checkpoint:
+                trainer.depth_scale.data[...] = checkpoint['depth_scale']
+            
+            print(f"  ✓ Resumed from epoch {checkpoint['epoch']}")
+            print(f"  ✓ Previous loss: {checkpoint['loss']:.6f}")
+            print(f"  ✓ Continuing from epoch {start_epoch}")
+        else:
+            print("\n✓ No checkpoints found. Starting training from scratch.")
+    else:
+        print("\n✓ No checkpoint directory found. Starting training from scratch.")
+
     print("✓ Optimizer initialized.")
     
     # Logging
@@ -670,17 +727,18 @@ def main():
     Path('checkpoints').mkdir(exist_ok=True)
     
     # --- TRAINING LOOP ---
-    for ep in range(50):
+    for ep in range(start_epoch, 50):
         loss = trainer.train_epoch(loader, opt, ep, contact_weight=1.0, penetration_weight=10.0)
         print(f"  Ep {ep}: {loss:.4f}")
         
         with open(log_path, "a") as f: f.write(f"{ep}, {loss:.6f}\n")
         
-        if (ep+1)%10==0: trainer.save(f'checkpoints/cp_{ep+1}.pt', ep, opt, loss)
+        if (ep+1)%10==0: 
+            trainer.save(f'checkpoints/cp_{ep+1}.pt', ep, opt, loss)
 
         if args.viz_overlay is True:        
             # --- VIDEO SAVING EVERY 20 ITERATIONS ---
-            if (ep + 1) % 20 == 0:
+            if (ep + 1) % 20 == 0 or ep == 0:
                 print(f"\nCreating visualization for Epoch {ep}...")
                 # Pick the first session (train_data[0]) to visualize consistency
                 vis_sample = train_data[0]
