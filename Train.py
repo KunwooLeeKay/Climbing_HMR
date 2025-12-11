@@ -41,7 +41,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Make argparse object
 parser = argparse.ArgumentParser(description='Run Training')
-parser.add_argument('--viz_overlay', type=int, help='Sequence index', default=False)
+parser.add_argument('--viz_overlay', action='store_true', help='Whether to visualize overlay videos during training')
 parser.add_argument('--dataset_train_dir', type=str, help='Dataset_Train directory path', default = None)
 args = parser.parse_args()
 
@@ -581,7 +581,6 @@ def main():
     testing_sessions = ['20240927JimeiYanwu_YYY_001']
     training_sessions = [s for s in training_sessions if s not in testing_sessions]
 
-    st()
     
     # Load training data
     train_data = []
