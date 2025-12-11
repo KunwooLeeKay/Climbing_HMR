@@ -31,6 +31,13 @@ import argparse
 
 from pdb import set_trace as st
 
+# depth scale
+from initial_depth_scale import compute_initial_depth_scale, knn_debug_distance_batch,save_points_as_ply,debug_plot_points
+import matplotlib
+matplotlib.use("Agg") 
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
 # Make argparse object
 parser = argparse.ArgumentParser(description='Run Training')
 parser.add_argument('--viz_overlay', type=int, help='Sequence index', default=False)
@@ -57,6 +64,7 @@ def verify_alignment_video(session_data, wall_obj, verts_wall_cam, device, outpu
     
     # 1. Setup Image Paths
     img_dir = f'/home/kunwoo/Linux_Folder/Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train_2D/{session_name}_images'
+    img_dir= '.'
     images = sorted(os.listdir(img_dir))
     
     # Load first image for resolution
@@ -224,6 +232,8 @@ class ClimbingMocapTrainer:
         self.loss_fn = loss_fn
         self.device = device
         self.smpl_mlp = None
+        self.depth_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32, device=device))
+        self.contact_indices = self.loss_fn.contact_indices.to(self.device)
         
     def forward_pass(self, params_init, betas):
         if self.smpl_mlp is None:
@@ -243,8 +253,9 @@ class ClimbingMocapTrainer:
     def train_epoch(self, loader, opt, epoch, **kwargs):
         if self.smpl_mlp: self.smpl_mlp.train()
         losses = []
+        tot_con_losses = []
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             opt.zero_grad()
             if not self.smpl_mlp: 
                 self.forward_pass(batch['smpl_params'], batch['betas'])
@@ -252,11 +263,33 @@ class ClimbingMocapTrainer:
                 self.smpl_mlp.train()
             
             verts, params_ref = self.forward_pass(batch['smpl_params'], batch['betas'])
-            
+            # depth scale
+            scale_vec = torch.stack([
+                torch.ones((), device=verts.device), 
+                torch.ones((), device=verts.device), 
+                self.depth_scale 
+            ])
+            verts_scaled = verts * scale_vec.view(1, 1, 3)
+            if batch_idx == 0 and epoch % 1 == 0:
+                knn_debug_distance_batch(
+                    verts_scaled,          # (B,V,3)
+                    self.wall_verts,       # (W,3)
+                    self.contact_indices,  # (C,)
+                    self.device,
+                    name=f"epoch{epoch}_batch0"
+                )
+                print("self.depth_scale", self.depth_scale.detach())
+                debug_plot_points(verts_scaled, self.wall_verts, epoch)
+                body_pts = verts_scaled[100]          # (V,3)
+                wall_pts = self.wall_verts          # (W,3)
+                save_points_as_ply(body_pts, "debug_vis/body_epoch0.ply")
+                save_points_as_ply(wall_pts, "debug_vis/wall.ply")
+
             tot_pen = 0; tot_con = 0; tot_loss = 0
             chunk = 64
             for i in range(0, len(verts), chunk):
-                v_chunk = verts[i:i+chunk]
+                v_chunk = verts_scaled[i:i+chunk]
+
                 l_main, l_dict = self.loss_fn(v_chunk, self.wall_verts, None, **kwargs)
                 weight = len(v_chunk)/len(verts)
                 tot_pen += l_dict['penetration_loss'] * weight
@@ -269,8 +302,10 @@ class ClimbingMocapTrainer:
             torch.nn.utils.clip_grad_norm_(self.smpl_mlp.parameters(), 1.0)
             opt.step()
             losses.append(loss.item())
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'pen': f"{tot_pen.item():.4f}"})
-            
+            tot_con_losses.append(tot_con.item())
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'pen': f"{tot_pen.item():.4f}", 'con': f"{tot_con.item():.4f}"})
+        
+        print(f'epoch {epoch} con loss {np.mean(tot_con_losses)}')
         return np.mean(losses)
     
     def save(self, path, epoch, opt, loss):
@@ -321,7 +356,22 @@ def main():
     # Init Optimizer
     first_batch = next(iter(loader))
     trainer.forward_pass(first_batch['smpl_params'], first_batch['betas'])
-    opt = optim.Adam(trainer.smpl_mlp.parameters(), lr=1e-4)
+    # opt = optim.Adam(trainer.smpl_mlp.parameters(), lr=1e-4)
+    #########################
+    # depth scale
+    init_scale = compute_initial_depth_scale(
+        data=data,
+        body_model=body,
+        verts_wall_cam=verts_wall_cam,
+        device=device,
+    )
+    trainer.depth_scale.data[...] = init_scale
+    opt = optim.Adam(
+            list(trainer.smpl_mlp.parameters()) + [trainer.depth_scale],
+            lr=1e-4
+        )
+    ######################
+
     print("✓ Optimizer initialized.")
     
     # Logging
