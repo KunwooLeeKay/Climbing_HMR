@@ -9,6 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 import cv2
 import torch.nn.functional as F
+import pickle
 
 # PyTorch3D Imports
 from pytorch3d.transforms import matrix_to_axis_angle
@@ -28,6 +29,95 @@ from loss.Loss import ClimbingLoss
 from wall_parameterization.Wall import Wall 
 
 from pdb import set_trace as st
+
+# ============================================================================
+# 0. LiDAR Data Loading Function (Frame-Aligned)
+# ============================================================================
+
+def load_lidar_for_session(session_name, num_frames, device='cuda', 
+                           dataset_train_dir=None, lidar_scale=0.22):
+    """
+    Load LiDAR point clouds for all frames of a session, ensuring frame alignment with SMPL.
+    
+    The key is: SMPL frame i must correspond to LiDAR frame i.
+    
+    Args:
+        session_name: Session name (e.g., '20240927JimeiYanwu_WJY_001')
+        num_frames: Number of frames in SMPL params (to ensure alignment)
+        device: Device to use
+        dataset_train_dir: Path to Dataset_Train directory
+        lidar_scale: Scale factor for LiDAR points
+    
+    Returns:
+        lidar_points_by_frame: List of (M_i, 3) tensors, one per frame
+                               lidar_points_by_frame[i] = LiDAR points for frame i
+                               Returns None if LiDAR data not available
+    """
+    if dataset_train_dir is None:
+        dataset_train_dir = 'Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train'
+    
+    pkl_path = os.path.join(dataset_train_dir, f'filtered_{session_name}_label_visualization_IMU_GT.pkl')
+    npz_path = os.path.join(dataset_train_dir, f'{session_name}_W2C.npz')
+    
+    if not os.path.exists(pkl_path) or not os.path.exists(npz_path):
+        print(f"  ⚠ LiDAR data not found for {session_name}")
+        return None
+    
+    try:
+        # Load LiDAR data
+        with open(pkl_path, 'rb') as f:
+            data = pickle.load(f)
+        point_clouds = data['second_person']['point_clouds']  # (N_lidar_frames, 512, 3) in world coords
+        
+        # Load transformation matrix
+        T_w2c = np.load(npz_path)['T_w2c']  # (4, 4)
+        T_w2c_torch = torch.from_numpy(T_w2c).float().to(device)
+        
+        lidar_num_frames = point_clouds.shape[0]
+        
+        # Check frame count alignment
+        if lidar_num_frames != num_frames:
+            print(f"  ⚠ Frame count mismatch: SMPL={num_frames}, LiDAR={lidar_num_frames}")
+            # Use minimum to avoid out-of-bounds
+            num_frames_to_use = min(num_frames, lidar_num_frames)
+        else:
+            num_frames_to_use = num_frames
+        
+        # Transform all frames to camera coordinates (frame-by-frame)
+        lidar_points_by_frame = []
+        for frame_idx in range(num_frames_to_use):
+            # Get LiDAR points for this specific frame
+            points_world = point_clouds[frame_idx]  # (512, 3) in world coordinates
+            points_world_torch = torch.from_numpy(points_world).float().to(device)
+            
+            # Filter valid points (remove zero-padding)
+            valid_mask = points_world_torch.norm(dim=-1) > 1e-3
+            points_world_valid = points_world_torch[valid_mask]
+            
+            if len(points_world_valid) == 0:
+                # No valid points for this frame - use empty tensor
+                lidar_points_by_frame.append(torch.zeros((0, 3), device=device))
+                continue
+            
+            # Transform to camera coordinates using T_w2c
+            ones = torch.ones((points_world_valid.shape[0], 1), device=device)
+            points_homo = torch.cat([points_world_valid, ones], dim=1)  # (M, 4)
+            points_cam_homo = (T_w2c_torch @ points_homo.T).T  # (M, 4)
+            lidar_points_cam = points_cam_homo[:, :3] * lidar_scale  # (M, 3) in camera coords
+            
+            lidar_points_by_frame.append(lidar_points_cam)
+        
+        # Pad if needed to match num_frames
+        if num_frames_to_use < num_frames:
+            for _ in range(num_frames - num_frames_to_use):
+                lidar_points_by_frame.append(torch.zeros((0, 3), device=device))
+        
+        print(f"  ✓ Loaded LiDAR: {num_frames_to_use} frames (aligned with SMPL frames 0-{num_frames_to_use-1})")
+        return lidar_points_by_frame  # List where lidar_points_by_frame[i] = LiDAR for frame i
+        
+    except Exception as e:
+        print(f"  ⚠ Error loading LiDAR for {session_name}: {e}")
+        return None
 
 # ============================================================================
 # 1. Visualization Function (Updated for Training Loop)
@@ -244,23 +334,70 @@ class ClimbingMocapTrainer:
             
             verts, params_ref = self.forward_pass(batch['smpl_params'], batch['betas'])
             
-            tot_pen = 0; tot_con = 0; tot_loss = 0
+            # Get LiDAR data for this session (frame-aligned)
+            lidar_points_by_frame = batch.get('lidar_points_by_frame', None)
+            
+            tot_pen = 0; tot_con = 0; tot_depth = 0; tot_loss = 0
             chunk = 64
             for i in range(0, len(verts), chunk):
-                v_chunk = verts[i:i+chunk]
-                l_main, l_dict = self.loss_fn(v_chunk, self.wall_verts, None, **kwargs)
+                v_chunk = verts[i:i+chunk]  # (chunk_size, 6890, 3) - SMPL vertices for frames [i:i+chunk]
+                chunk_end = min(i+chunk, len(verts))
+                chunk_indices = list(range(i, chunk_end))
+                
+                # Prepare LiDAR points for this chunk (frame-by-frame matching)
+                # Key: SMPL frame i must match LiDAR frame i
+                lidar_chunk = None
+                if lidar_points_by_frame is not None:
+                    # Collect LiDAR points for each frame in this chunk
+                    lidar_frames_list = []
+                    for frame_idx in chunk_indices:
+                        if frame_idx < len(lidar_points_by_frame):
+                            lidar_frame = lidar_points_by_frame[frame_idx]  # (M_i, 3) - LiDAR for frame frame_idx
+                            if lidar_frame.shape[0] > 0:
+                                lidar_frames_list.append(lidar_frame)
+                            else:
+                                # Empty frame - use dummy point (will be filtered by loss)
+                                lidar_frames_list.append(torch.zeros((1, 3), device=self.device))
+                        else:
+                            # Frame out of range - use dummy
+                            lidar_frames_list.append(torch.zeros((1, 3), device=self.device))
+                    
+                    if len(lidar_frames_list) > 0:
+                        # Find max M to pad all frames to same size
+                        max_M = max(f.shape[0] for f in lidar_frames_list)
+                        
+                        # Pad and stack to (chunk_size, max_M, 3) for frame-by-frame matching
+                        lidar_padded = []
+                        for lidar_frame in lidar_frames_list:
+                            M = lidar_frame.shape[0]
+                            if M < max_M:
+                                # Pad with zeros
+                                padding = torch.zeros((max_M - M, 3), device=self.device)
+                                lidar_padded.append(torch.cat([lidar_frame, padding], dim=0))
+                            else:
+                                lidar_padded.append(lidar_frame)
+                        
+                        lidar_chunk = torch.stack(lidar_padded, dim=0)  # (chunk_size, max_M, 3)
+                        # Now: lidar_chunk[i] matches v_chunk[i] (frame i)
+                
+                # Compute loss: v_chunk[i] (SMPL frame i) will be compared with LiDAR from frame i
+                l_main, l_dict = self.loss_fn(v_chunk, self.wall_verts, lidar_chunk, **kwargs)
                 weight = len(v_chunk)/len(verts)
                 tot_pen += l_dict['penetration_loss'] * weight
                 tot_con += l_dict['contact_loss'] * weight
+                tot_depth += l_dict.get('depth_loss', torch.tensor(0.0, device=self.device)) * weight
             
             reg = sum(F.mse_loss(params_ref[k], batch['smpl_params'][k]) for k in ['body_pose','global_orient','transl'])
-            loss = (kwargs.get('penetration_weight',10)*tot_pen + kwargs.get('contact_weight',1)*tot_con) + 0.01*reg
+            loss = (kwargs.get('penetration_weight',10)*tot_pen + 
+                   kwargs.get('contact_weight',1)*tot_con + 
+                   kwargs.get('depth_weight',0.0)*tot_depth) + 0.01*reg
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.smpl_mlp.parameters(), 1.0)
             opt.step()
             losses.append(loss.item())
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'pen': f"{tot_pen.item():.4f}"})
+            depth_str = f", depth: {tot_depth.item():.4f}" if tot_depth.item() > 0 else ""
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'pen': f"{tot_pen.item():.4f}", 'con': f"{tot_con.item():.4f}" + depth_str})
             
         return np.mean(losses)
     
@@ -288,9 +425,14 @@ def main():
     training_sessions = sorted(os.listdir('ascendmotion_merged'))
     training_sessions = training_sessions[:-1]
     
+    # LiDAR configuration
+    dataset_train_dir = 'Ascend_Motion_Dataset/AscendMotion_Dataset_Release_v1/Dataset_Train'
+    lidar_scale = 0.22  # Scale factor for LiDAR points
+    
     data = []
     for s in training_sessions:
-        p = f'ascendmotion_merged/{s.replace("_images","")}/merged_smpl_params.pt'
+        session_name = s.replace("_images","")
+        p = f'ascendmotion_merged/{session_name}/merged_smpl_params.pt'
         if not os.path.exists(p): continue
         params = torch.load(p, map_location='cpu')
         params = {k: v.to(device) for k,v in params.items()}
@@ -300,8 +442,22 @@ def main():
         if params['global_orient'].dim() >= 3: 
              params['global_orient'] = matrix_to_axis_angle(params['global_orient'].reshape(-1,3,3)).reshape(len(params['global_orient']),-1)
 
-        data.append({'smpl_params': params, 'betas': params.get('betas', torch.zeros(len(params['body_pose']), 10, device=device)), 'session_name': s.replace("_images",""), 'gvhmr_K': params['K_fullimg']})
-        print(f"  ✓ {s}")
+        num_frames = len(params['body_pose'])
+        
+        # Load LiDAR data (frame-aligned: LiDAR frame i matches SMPL frame i)
+        lidar_points_by_frame = load_lidar_for_session(
+            session_name, num_frames, device=device, 
+            dataset_train_dir=dataset_train_dir, lidar_scale=lidar_scale
+        )
+
+        data.append({
+            'smpl_params': params, 
+            'betas': params.get('betas', torch.zeros(num_frames, 10, device=device)), 
+            'session_name': session_name, 
+            'gvhmr_K': params['K_fullimg'],
+            'lidar_points_by_frame': lidar_points_by_frame  # List: lidar_points_by_frame[i] = LiDAR for frame i
+        })
+        print(f"  ✓ {s} ({num_frames} frames)")
 
     print("\n" + "="*60 + "\nSTARTING TRAINING\n" + "="*60)
     body = smplx.create(model_path="smpl_models", model_type="smpl", gender='male', batch_size=16).to(device).eval()
@@ -323,7 +479,13 @@ def main():
     
     # --- TRAINING LOOP ---
     for ep in range(50):
-        loss = trainer.train_epoch(loader, opt, ep, contact_weight=1.0, penetration_weight=10.0)
+        # Set depth_weight to enable/disable LiDAR loss
+        # 1.0 = enable LiDAR loss, 0.0 = disable (train without LiDAR)
+        depth_weight = 1.0  # Change to 0.0 to disable LiDAR loss
+        loss = trainer.train_epoch(loader, opt, ep, 
+                                  contact_weight=1.0, 
+                                  penetration_weight=10.0,
+                                  depth_weight=depth_weight)
         print(f"  Ep {ep}: {loss:.4f}")
         
         with open(log_path, "a") as f: f.write(f"{ep}, {loss:.6f}\n")
