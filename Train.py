@@ -264,9 +264,14 @@ class ClimbingMocapTrainer:
             
             verts, params_ref = self.forward_pass(batch['smpl_params'], batch['betas'])
             # depth scale
+            # scale_vec = torch.stack([
+            #     torch.ones((), device=verts.device), 
+            #     torch.ones((), device=verts.device), 
+            #     self.depth_scale 
+            # ])
             scale_vec = torch.stack([
-                torch.ones((), device=verts.device), 
-                torch.ones((), device=verts.device), 
+                self.depth_scale, 
+                self.depth_scale, 
                 self.depth_scale 
             ])
             verts_scaled = verts * scale_vec.view(1, 1, 3)
